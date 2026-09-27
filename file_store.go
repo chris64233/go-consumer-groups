@@ -38,7 +38,26 @@ type fileGroupSnapshot struct {
 	LastRebalance  time.Time          `json:"last_rebalance"`
 	Members        []fileMemberSnap   `json:"members"`
 	Assignment     fileAssignmentSnap `json:"assignment"`
-	Offsets        []fileOffsetSnap   `json:"offsets"`
+	// 以下为协作式再均衡状态；旧版本（v1）快照没有这些字段，
+	// 反序列化为零值，恢复时视为再均衡已完成。
+	Target  fileAssignmentSnap   `json:"target,omitempty"`
+	Pending []fileRevocationSnap `json:"pending_revocations,omitempty"`
+	Acks    []fileAckSnap        `json:"acks,omitempty"`
+	Offsets []fileOffsetSnap     `json:"offsets"`
+}
+
+// fileRevocationSnap 是一条待撤销记录的 JSON 格式。
+type fileRevocationSnap struct {
+	Partition int    `json:"partition"`
+	From      string `json:"from"`
+	To        string `json:"to"`
+}
+
+// fileAckSnap 是成员撤销进度的 JSON 格式。
+type fileAckSnap struct {
+	MemberID       string `json:"member_id"`
+	Acked          []int  `json:"acked,omitempty"`
+	ForceReclaimed []int  `json:"force_reclaimed,omitempty"`
 }
 
 type fileMemberSnap struct {
@@ -70,7 +89,11 @@ type fileOffsetSnap struct {
 	LastRequestID string    `json:"last_request_id"`
 }
 
-const snapshotFormatVersion = 1
+const snapshotFormatVersion = 2
+
+// snapshotFormatVersionLegacy 是引入协作式再均衡状态之前的快照版本，
+// 仍可被读取（缺失的协作式字段按「再均衡已完成」处理）。
+const snapshotFormatVersionLegacy = 1
 
 // Save 原子写入整份快照。
 func (s *FileStore) Save(snap Snapshot) error {
@@ -121,7 +144,7 @@ func (s *FileStore) Load() (*Snapshot, error) {
 	if err := json.Unmarshal(data, &fs); err != nil {
 		return nil, fmt.Errorf("decode state file: %w", err)
 	}
-	if fs.Version != snapshotFormatVersion {
+	if fs.Version != snapshotFormatVersion && fs.Version != snapshotFormatVersionLegacy {
 		return nil, errCorrupt("unsupported snapshot version %d", fs.Version)
 	}
 	return fromFileSnapshot(&fs), nil
@@ -143,7 +166,26 @@ func toFileSnapshot(s *Snapshot) fileSnapshot {
 				CreatedAt:  g.Assignment.CreatedAt,
 				Owners:     append([]string(nil), g.Assignment.Owners...),
 			},
+			Target: fileAssignmentSnap{
+				Generation: g.Target.Generation,
+				CreatedAt:  g.Target.CreatedAt,
+				Owners:     append([]string(nil), g.Target.Owners...),
+			},
+			Pending: make([]fileRevocationSnap, 0, len(g.PendingRevocations)),
+			Acks:    make([]fileAckSnap, 0, len(g.Acks)),
 			Offsets: make([]fileOffsetSnap, 0, len(g.Offsets)),
+		}
+		for _, pr := range g.PendingRevocations {
+			fg.Pending = append(fg.Pending, fileRevocationSnap{
+				Partition: pr.Partition, From: pr.From, To: pr.To,
+			})
+		}
+		for _, a := range g.Acks {
+			fg.Acks = append(fg.Acks, fileAckSnap{
+				MemberID:       a.MemberID,
+				Acked:          append([]int(nil), a.Acked...),
+				ForceReclaimed: append([]int(nil), a.ForceReclaimed...),
+			})
 		}
 		for _, m := range g.Members {
 			fm := fileMemberSnap{
@@ -193,7 +235,26 @@ func fromFileSnapshot(fs *fileSnapshot) *Snapshot {
 				CreatedAt:  fg.Assignment.CreatedAt,
 				Owners:     append([]string(nil), fg.Assignment.Owners...),
 			},
-			Offsets: make([]Offset, 0, len(fg.Offsets)),
+			Target: Assignment{
+				Generation: fg.Target.Generation,
+				CreatedAt:  fg.Target.CreatedAt,
+				Owners:     append([]string(nil), fg.Target.Owners...),
+			},
+			PendingRevocations: make([]PartitionRevocation, 0, len(fg.Pending)),
+			Acks:               make([]MemberAckSnapshot, 0, len(fg.Acks)),
+			Offsets:            make([]Offset, 0, len(fg.Offsets)),
+		}
+		for _, fr := range fg.Pending {
+			g.PendingRevocations = append(g.PendingRevocations, PartitionRevocation{
+				Partition: fr.Partition, From: fr.From, To: fr.To,
+			})
+		}
+		for _, fa := range fg.Acks {
+			g.Acks = append(g.Acks, MemberAckSnapshot{
+				MemberID:       fa.MemberID,
+				Acked:          append([]int(nil), fa.Acked...),
+				ForceReclaimed: append([]int(nil), fa.ForceReclaimed...),
+			})
 		}
 		for _, fm := range fg.Members {
 			m := MemberSnapshot{

@@ -32,6 +32,49 @@ func (a *Assignment) OwnerOf(partition int) string {
 	return a.Owners[partition]
 }
 
+// PartitionRevocation 是一条待撤销记录：分区 Partition 当前仍由 From 持有，
+// 待 From 确认撤销（或超时被强制回收）后转移给 To。
+type PartitionRevocation struct {
+	Partition int
+	// From 当前（旧）所有者，撤销确认前继续消费并允许提交最终位点。
+	From string
+	// To 目标所有者，撤销完成前不能取得该分区。
+	To string
+}
+
+// MemberAckProgress 是单个成员在当前分配版本下的撤销确认进度。
+type MemberAckProgress struct {
+	MemberID string
+	// Required 本代要求该成员撤销的全部分区（升序）= Acked + Outstanding + ForceReclaimed。
+	Required []int
+	// Acked 已被成员确认撤销的分区（升序）。
+	Acked []int
+	// Outstanding 仍待成员确认的分区（升序）。
+	Outstanding []int
+	// ForceReclaimed 因成员离开/超时被协调器强制回收的分区（升序）。
+	ForceReclaimed []int
+}
+
+// RevocationAck 是一次撤销确认请求。确认必须精确匹配：组、成员、
+// 分配版本与分区集合四者缺一不可；分区集合多报、漏报都会被拒绝。
+type RevocationAck struct {
+	// MemberID 确认成员，必须是分区的当前（旧）所有者。
+	MemberID string
+	// Generation 成员持有的分配版本，与协调器不一致则拒绝。
+	Generation int64
+	// Partitions 成员确认撤销的分区集合，必须与其当前待撤销集合完全一致
+	// （顺序无关，重复项会被归并）。确认是幂等的：相同内容重试原样成功。
+	Partitions []int
+}
+
+// RevocationAckResult 是撤销确认的返回值。
+type RevocationAckResult struct {
+	// Transferred 本次确认后完成所有权转移的分区（升序）。
+	Transferred []int
+	// RebalanceComplete 为 true 表示本代再均衡的全部撤销均已完成。
+	RebalanceComplete bool
+}
+
 // Offset 是单个分区已提交位点的元数据。
 type Offset struct {
 	Partition int
@@ -52,11 +95,20 @@ type GroupStatus struct {
 	Generation int64
 	// Leader 第一个加入组的成员；它退出后由当前存活成员中加入最早者接任，
 	// 为空表示组内没有成员。
-	Leader        string
-	Members       []Member
-	Assignment    Assignment
-	Offsets       []Offset
-	LastRebalance time.Time
+	Leader  string
+	Members []Member
+	// Assignment 当前有效所有权：待撤销分区在确认前仍归旧所有者。
+	Assignment Assignment
+	// Target 本代目标所有权；再均衡完成后与 Assignment 一致。
+	Target Assignment
+	// PendingRevocations 当前待撤销集合（按分区升序）。
+	PendingRevocations []PartitionRevocation
+	// AckProgress 各成员在本代的撤销确认进度（按成员 ID 升序）。
+	AckProgress []MemberAckProgress
+	// RebalanceComplete 为 true 表示本代没有待撤销分区。
+	RebalanceComplete bool
+	Offsets           []Offset
+	LastRebalance     time.Time
 }
 
 // JoinResult 是加入组的返回值：成员立即进入新版本并获得整份分配。
@@ -64,15 +116,28 @@ type JoinResult struct {
 	MemberID   string
 	Generation int64
 	Leader     string
-	// Assignment 当前版本（含新成员）的完整分配快照。
+	// Assignment 当前版本（含新成员）的有效分配快照。
 	Assignment Assignment
+	// Target 本代目标所有权。
+	Target Assignment
+	// Revocations 本成员当前待确认撤销的分区（升序）。
+	Revocations []int
+	// RebalanceComplete 为 true 表示本代没有待撤销分区。
+	RebalanceComplete bool
 }
 
 // HeartbeatResult 是心跳的返回值。
 type HeartbeatResult struct {
 	Generation int64
-	// Assignment 当前版本的完整分配快照，客户端可据此核对本地视图。
+	// Assignment 当前版本的有效分配快照，客户端可据此核对本地视图。
 	Assignment Assignment
+	// Target 本代目标所有权。
+	Target Assignment
+	// Revocations 本成员当前待确认撤销的分区（升序）：
+	// 成员应对这些分区停止消费、提交最终位点后调用 AcknowledgeRevocation。
+	Revocations []int
+	// RebalanceComplete 为 true 表示本代没有待撤销分区。
+	RebalanceComplete bool
 }
 
 // CommitResult 是位点提交的返回值。

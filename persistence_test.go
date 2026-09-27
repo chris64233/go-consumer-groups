@@ -21,8 +21,9 @@ func TestFileStorePersistenceAndRecovery(t *testing.T) {
 	if err := c.CreateGroup(CreateGroupOptions{Name: "g", Partitions: 3, SessionTimeout: 7 * time.Second}); err != nil {
 		t.Fatal(err)
 	}
-	mustJoin(t, c, "g", "a") // gen 1
-	mustJoin(t, c, "g", "b") // gen 2: owners [a b a]
+	mustJoin(t, c, "g", "a")   // gen 1
+	mustJoin(t, c, "g", "b")   // gen 2: 目标 owners [a b a]，分区 1 待撤销
+	settleRebalance(t, c, "g") // 确认撤销后有效所有权收敛为 [a b a]
 	if _, err := c.CommitOffset("g", CommitRequest{
 		MemberID: "a", Generation: 2, Partition: 0, Offset: 42, Metadata: "m0", RequestID: "req-0",
 	}); err != nil {

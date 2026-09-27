@@ -29,6 +29,9 @@ var (
 	ErrInvalidPartition = errors.New("invalid partition")
 	// ErrInvalidArgument 参数非法。
 	ErrInvalidArgument = errors.New("invalid argument")
+	// ErrRevocationMismatch 撤销确认与协调器记录的待撤销集合不一致
+	// （漏报、多报或对无撤销义务的分区确认）。
+	ErrRevocationMismatch = errors.New("revocation acknowledgement does not match pending set")
 )
 
 // GenerationMismatchError 在操作携带的分配版本与当前版本不一致时返回。
@@ -103,3 +106,23 @@ func (e *OffsetBacktrackError) Error() string {
 }
 
 func (e *OffsetBacktrackError) Is(target error) bool { return target == ErrOffsetBacktrack }
+
+// RevocationMismatchError 在撤销确认的分区集合与协调器记录的待撤销集合
+// 不一致时返回。Missing 与 Extra 明确指出差异，调用方应拉取最新状态后重试。
+type RevocationMismatchError struct {
+	Group      string
+	Member     string
+	Generation int64
+	// Missing 待撤销但确认中缺失的分区（升序）。
+	Missing []int
+	// Extra 确认中多出的、不属于该成员待撤销集合的分区（升序）。
+	Extra []int
+}
+
+func (e *RevocationMismatchError) Error() string {
+	return fmt.Sprintf("%s: group=%q member=%q generation=%d missing=%v extra=%v",
+		ErrRevocationMismatch, e.Group, e.Member, e.Generation, e.Missing, e.Extra)
+}
+
+// Is 让 errors.Is(err, ErrRevocationMismatch) 成立。
+func (e *RevocationMismatchError) Is(target error) bool { return target == ErrRevocationMismatch }

@@ -73,10 +73,16 @@ func TestJoinProducesDeterministicAssignment(t *testing.T) {
 	if st.Generation != 3 {
 		t.Fatalf("generation after 3 joins = %d, want 3", st.Generation)
 	}
-	// 排序后 [alpha bravo charlie]：分区 i -> members[i%3]
+	// 协作式再均衡：撤销确认前，有效所有权仍归旧所有者 charlie；
+	// 目标所有权已是确定性全量分配。
+	if want := []string{"alpha", "bravo", "charlie", "alpha", "bravo"}; !equalStrings(st.Target.Owners, want) {
+		t.Fatalf("gen 3 target owners = %v, want %v", st.Target.Owners, want)
+	}
+	// 确认全部撤销后，有效所有权收敛到目标。
+	st = settleRebalance(t, c, "g")
 	want = []string{"alpha", "bravo", "charlie", "alpha", "bravo"}
 	if got := st.Assignment.Owners; !equalStrings(got, want) {
-		t.Fatalf("gen 3 owners = %v, want %v", got, want)
+		t.Fatalf("gen 3 owners after settle = %v, want %v", got, want)
 	}
 	if st.Leader != "charlie" { // 第一个加入者
 		t.Fatalf("leader = %q, want charlie", st.Leader)
@@ -432,7 +438,8 @@ func TestCommitIdempotencyAndConflict(t *testing.T) {
 	}
 }
 
-// 再均衡后，旧所有者对新所有者分区的提交必须失败。
+// 协作式再均衡中，待撤销分区在确认前仍归旧所有者（可提交最终位点），
+// 新所有者不能提前取得；确认转移后旧成员的迟到提交被栅栏。
 func TestCommitRejectedAfterRebalance(t *testing.T) {
 	c, _ := NewCoordinator(nil, nil)
 	_ = c.CreateGroup(CreateGroupOptions{Name: "g", Partitions: 2})
@@ -442,26 +449,43 @@ func TestCommitRejectedAfterRebalance(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	mustJoin(t, c, "g", "b") // gen 2: [a b]
+	mustJoin(t, c, "g", "b") // gen 2: 目标 [a b]，分区 1 待撤销（a -> b）
 
-	// a 携带新版本提交分区 1：它已不是所有者。
-	_, err := c.CommitOffset("g", CommitRequest{
-		MemberID: "a", Generation: 2, Partition: 1, Offset: 6, RequestID: "r2",
-	})
-	if !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("former owner commit should fail with ErrNotOwner, got %v", err)
-	}
-	// b 成为新所有者，可以提交。
+	// 撤销确认前：新所有者 b 不能取得分区 1。
 	if _, err := c.CommitOffset("g", CommitRequest{
-		MemberID: "b", Generation: 2, Partition: 1, Offset: 6, RequestID: "r3",
+		MemberID: "b", Generation: 2, Partition: 1, Offset: 6, RequestID: "r2",
+	}); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("new owner commit before revocation should fail with ErrNotOwner, got %v", err)
+	}
+	// 旧所有者 a 可提交最终位点。
+	if _, err := c.CommitOffset("g", CommitRequest{
+		MemberID: "a", Generation: 2, Partition: 1, Offset: 6, RequestID: "r3",
 	}); err != nil {
-		t.Fatalf("new owner commit: %v", err)
+		t.Fatalf("former owner final commit before ack: %v", err)
+	}
+
+	// a 确认撤销分区 1，所有权转移给 b。
+	res, err := c.AcknowledgeRevocation("g", RevocationAck{MemberID: "a", Generation: 2, Partitions: []int{1}})
+	if err != nil || !res.RebalanceComplete {
+		t.Fatalf("ack = %+v, %v", res, err)
+	}
+
+	// 转移完成后：a 的迟到提交被栅栏。
+	if _, err := c.CommitOffset("g", CommitRequest{
+		MemberID: "a", Generation: 2, Partition: 1, Offset: 7, RequestID: "r4",
+	}); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("former owner late commit should be fenced with ErrNotOwner, got %v", err)
+	}
+	// b 成为有效所有者，可以提交。
+	if _, err := c.CommitOffset("g", CommitRequest{
+		MemberID: "b", Generation: 2, Partition: 1, Offset: 7, RequestID: "r5",
+	}); err != nil {
+		t.Fatalf("new owner commit after transfer: %v", err)
 	}
 	// a 用旧版本重试旧请求号：版本先拒绝，不会触碰幂等表。
-	_, err = c.CommitOffset("g", CommitRequest{
+	if _, err := c.CommitOffset("g", CommitRequest{
 		MemberID: "a", Generation: 1, Partition: 1, Offset: 5, RequestID: "r1",
-	})
-	if !errors.Is(err, ErrIllegalGeneration) {
+	}); !errors.Is(err, ErrIllegalGeneration) {
 		t.Fatalf("stale generation commit: %v", err)
 	}
 }
@@ -524,13 +548,16 @@ func TestConcurrentLeaveExpireHeartbeatVersionChain(t *testing.T) {
 	if len(st.Members) != 3 {
 		t.Fatalf("remaining members = %d, want 3", len(st.Members))
 	}
+	// 确认存活成员的待撤销分区后，有效所有权收敛到确定性目标分配。
+	st = settleRebalance(t, c, "g")
 	if !assignmentMatchesMembers(st.Assignment, st.MemberIDs()) {
 		t.Fatalf("final assignment inconsistent with members: owners=%v members=%v",
 			st.Assignment.Owners, st.MemberIDs())
 	}
 
-	// 回放所有持久化快照：版本号严格按保存顺序单调不减（重入 Save 时相等），
-	// 且每次快照的 owners 恰好是当时成员集合的确定性分配。
+	// 回放所有持久化快照：版本号严格按保存顺序单调不减（重入 Save 时相等）；
+	// 每次快照的目标所有权恰好是当时成员集合的确定性分配，
+	// 且有效所有权只引用当时存活的成员（撤销中的分区仍归旧所有者）。
 	records := store.records()
 	var prev int64
 	for i, rec := range records {
@@ -547,8 +574,13 @@ func TestConcurrentLeaveExpireHeartbeatVersionChain(t *testing.T) {
 			ids = append(ids, id)
 		}
 		expected := planAssignment(g.generation, 8, membersFromIDs(ids, clk.Now()), clk.Now())
-		if !equalStrings(g.owners, expected.Owners) {
-			t.Fatalf("persisted owners gen=%d = %v, want %v", g.generation, g.owners, expected.Owners)
+		if !equalStrings(g.target, expected.Owners) {
+			t.Fatalf("persisted target gen=%d = %v, want %v", g.generation, g.target, expected.Owners)
+		}
+		for p, owner := range g.owners {
+			if owner != "" && !g.members[owner] {
+				t.Fatalf("persisted owners gen=%d: partition %d owner %q not a live member", g.generation, p, owner)
+			}
 		}
 		prev = g.generation
 	}
