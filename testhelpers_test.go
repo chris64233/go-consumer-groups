@@ -29,7 +29,7 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
-// recordingStore 包装 Store，记录每次 Save 时每个组的 (generation, owners)，
+// recordingStore 包装 Store，记录每次 Save 时每个组的 (generation, owners, target)，
 // 用于在并发测试中回放并校验分配版本序列。
 type recordingStore struct {
 	inner Store
@@ -37,6 +37,7 @@ type recordingStore struct {
 	saves []map[string]struct {
 		generation int64
 		owners     []string
+		target     []string
 		members    map[string]bool
 	}
 }
@@ -49,10 +50,12 @@ func (s *recordingStore) Save(snap Snapshot) error {
 	rec := make(map[string]struct {
 		generation int64
 		owners     []string
+		target     []string
 		members    map[string]bool
 	}, len(snap.Groups))
 	for _, g := range snap.Groups {
 		owners := append([]string(nil), g.Assignment.Owners...)
+		target := append([]string(nil), g.TargetAssignment.Owners...)
 		members := make(map[string]bool, len(g.Members))
 		for _, m := range g.Members {
 			members[m.ID] = true
@@ -60,8 +63,9 @@ func (s *recordingStore) Save(snap Snapshot) error {
 		rec[g.Name] = struct {
 			generation int64
 			owners     []string
+			target     []string
 			members    map[string]bool
-		}{g.Generation, owners, members}
+		}{g.Generation, owners, target, members}
 	}
 	s.mu.Lock()
 	s.saves = append(s.saves, rec)
@@ -74,6 +78,7 @@ func (s *recordingStore) Load() (*Snapshot, error) { return s.inner.Load() }
 func (s *recordingStore) records() []map[string]struct {
 	generation int64
 	owners     []string
+	target     []string
 	members    map[string]bool
 } {
 	s.mu.Lock()
@@ -81,6 +86,7 @@ func (s *recordingStore) records() []map[string]struct {
 	out := make([]map[string]struct {
 		generation int64
 		owners     []string
+		target     []string
 		members    map[string]bool
 	}, len(s.saves))
 	copy(out, s.saves)
@@ -92,6 +98,19 @@ func mustJoin(t *testing.T, c *Coordinator, group, member string) JoinResult {
 	res, err := c.Join(group, member)
 	if err != nil {
 		t.Fatalf("Join(%q, %q) unexpected error: %v", group, member, err)
+	}
+	return res
+}
+
+// mustAck 发起一次撤销确认并要求成功，返回确认结果。
+func mustAck(t *testing.T, c *Coordinator, group, member string, gen int64, partitions []int) RevocationAckResult {
+	t.Helper()
+	res, err := c.AckRevocation(group, RevocationAckRequest{
+		MemberID: member, Generation: gen, Partitions: partitions,
+	})
+	if err != nil {
+		t.Fatalf("AckRevocation(%q, %q, gen=%d, %v) unexpected error: %v",
+			group, member, gen, partitions, err)
 	}
 	return res
 }

@@ -18,11 +18,27 @@ type GroupSnapshot struct {
 	Partitions     int
 	SessionTimeout time.Duration
 	Generation     int64
-	Leader         string
-	LastRebalance  time.Time
-	Members        []MemberSnapshot
-	Assignment     Assignment
-	Offsets        []Offset
+	// Phase 版本状态机当前阶段（stable / revoking）。
+	Phase         RebalancePhase
+	Leader        string
+	LastRebalance time.Time
+	Members       []MemberSnapshot
+	// Assignment 当前生效所有权。
+	Assignment Assignment
+	// TargetAssignment 本版本目标所有权；stable 时与 Assignment 一致。
+	TargetAssignment Assignment
+	// Revocations 撤销阶段各成员的应撤销/已确认分区；stable 时为空。
+	Revocations []RevocationSnapshot
+	Offsets     []Offset
+}
+
+// RevocationSnapshot 是单个成员在当前版本下的撤销义务与确认进度。
+type RevocationSnapshot struct {
+	MemberID string
+	// Required 应撤销分区（升序）。
+	Required []int
+	// Acked 已确认撤销分区（升序，Required 的子集）。
+	Acked []int
 }
 
 // MemberSnapshot 是单个成员的持久化状态。
@@ -83,16 +99,29 @@ func (c *Coordinator) snapshotLocked() Snapshot {
 		}
 		sortOffsets(offsets)
 
+		revocations := make([]RevocationSnapshot, 0, len(g.revokeRequired))
+		for id, set := range g.revokeRequired {
+			revocations = append(revocations, RevocationSnapshot{
+				MemberID: id,
+				Required: sortedSet(set),
+				Acked:    sortedSet(g.revokeAcked[id]),
+			})
+		}
+		sortRevocations(revocations)
+
 		snap.Groups = append(snap.Groups, GroupSnapshot{
-			Name:           g.name,
-			Partitions:     g.partitions,
-			SessionTimeout: g.sessionTimeout,
-			Generation:     g.generation,
-			Leader:         g.leader,
-			LastRebalance:  g.lastRebalance,
-			Members:        members,
-			Assignment:     g.assignment.clone(),
-			Offsets:        offsets,
+			Name:             g.name,
+			Partitions:       g.partitions,
+			SessionTimeout:   g.sessionTimeout,
+			Generation:       g.generation,
+			Phase:            g.phase,
+			Leader:           g.leader,
+			LastRebalance:    g.lastRebalance,
+			Members:          members,
+			Assignment:       g.assignment.clone(),
+			TargetAssignment: g.target.clone(),
+			Revocations:      revocations,
+			Offsets:          offsets,
 		})
 	}
 	return snap
@@ -109,22 +138,70 @@ func (c *Coordinator) restore(snap *Snapshot) error {
 			partitions:     gs.Partitions,
 			sessionTimeout: gs.SessionTimeout,
 			generation:     gs.Generation,
+			phase:          gs.Phase,
 			leader:         gs.Leader,
 			lastRebalance:  gs.LastRebalance,
 			members:        make(map[string]*member, len(gs.Members)),
 			offsets:        make(map[int]*Offset, len(gs.Offsets)),
 			assignment:     gs.Assignment.clone(),
+			target:         gs.TargetAssignment.clone(),
+		}
+		if g.phase != PhaseStable && g.phase != PhaseRevoking {
+			return errCorrupt("group %q has unknown phase %q", gs.Name, gs.Phase)
 		}
 		if g.assignment.Owners == nil {
 			g.assignment.Owners = make([]string, gs.Partitions)
+		}
+		if g.target.Owners == nil {
+			g.target.Owners = make([]string, gs.Partitions)
 		}
 		if len(g.assignment.Owners) != gs.Partitions {
 			return errCorrupt("group %q assignment length %d != partitions %d",
 				gs.Name, len(g.assignment.Owners), gs.Partitions)
 		}
+		if len(g.target.Owners) != gs.Partitions {
+			return errCorrupt("group %q target assignment length %d != partitions %d",
+				gs.Name, len(g.target.Owners), gs.Partitions)
+		}
 		if g.assignment.Generation != gs.Generation {
 			return errCorrupt("group %q assignment generation %d != group generation %d",
 				gs.Name, g.assignment.Generation, gs.Generation)
+		}
+		if g.target.Generation != gs.Generation {
+			return errCorrupt("group %q target assignment generation %d != group generation %d",
+				gs.Name, g.target.Generation, gs.Generation)
+		}
+
+		g.revokeRequired = make(map[string]map[int]struct{})
+		g.revokeAcked = make(map[string]map[int]struct{})
+		for _, rv := range gs.Revocations {
+			req := make(map[int]struct{}, len(rv.Required))
+			for _, p := range rv.Required {
+				if p < 0 || p >= gs.Partitions {
+					return errCorrupt("group %q revocation required partition %d out of range", gs.Name, p)
+				}
+				if _, dup := req[p]; dup {
+					return errCorrupt("group %q revocation required has duplicate partition %d", gs.Name, p)
+				}
+				req[p] = struct{}{}
+			}
+			acked := make(map[int]struct{}, len(rv.Acked))
+			for _, p := range rv.Acked {
+				if _, ok := req[p]; !ok {
+					return errCorrupt("group %q member %q acked partition %d not in required set",
+						gs.Name, rv.MemberID, p)
+				}
+				if _, dup := acked[p]; dup {
+					return errCorrupt("group %q revocation acked has duplicate partition %d", gs.Name, p)
+				}
+				acked[p] = struct{}{}
+			}
+			g.revokeRequired[rv.MemberID] = req
+			// 仅当确有已确认分区时才记入 acked，保持「revokeAcked 的 key 数 ==
+			// 已完成确认的成员数」这一不变量（与运行时 rebalanceLocked 一致）。
+			if len(acked) > 0 {
+				g.revokeAcked[rv.MemberID] = acked
+			}
 		}
 
 		for _, ms := range gs.Members {
@@ -142,6 +219,67 @@ func (c *Coordinator) restore(snap *Snapshot) error {
 			}
 			g.members[ms.ID] = m
 		}
+
+		// 跨字段一致性：阶段与撤销义务集合、生效/目标所有权必须自洽。
+		if g.phase == PhaseStable {
+			if len(g.revokeRequired) > 0 {
+				return errCorrupt("group %q is stable but has %d pending revocations",
+					gs.Name, len(g.revokeRequired))
+			}
+			if !equalStringSlices(g.assignment.Owners, g.target.Owners) {
+				return errCorrupt("group %q is stable but effective and target owners differ", gs.Name)
+			}
+		} else {
+			if len(g.revokeRequired) == 0 {
+				return errCorrupt("group %q is revoking but has no required revocations", gs.Name)
+			}
+			inFlight := make(map[int]string)
+			for p := 0; p < gs.Partitions; p++ {
+				eff, tgt := g.assignment.Owners[p], g.target.Owners[p]
+				if eff == tgt {
+					continue // 已移交 / 未受影响 / 无主
+				}
+				// 仍由旧主持有的在途分区：旧主必须存活且该分区在其撤销义务中，
+				// 且尚未被确认。
+				if _, alive := g.members[eff]; !alive {
+					return errCorrupt("group %q partition %d effective owner %q not a member",
+						gs.Name, p, eff)
+				}
+				if _, ok := g.revokeRequired[eff][p]; !ok {
+					return errCorrupt("group %q partition %d in flight but missing from %q revocation set",
+						gs.Name, p, eff)
+				}
+				if _, isAcked := g.revokeAcked[eff][p]; isAcked {
+					return errCorrupt("group %q partition %d in flight but already acked by %q",
+						gs.Name, p, eff)
+				}
+				inFlight[p] = eff
+			}
+			// 反向校验：撤销义务中的每个分区要么仍在途由该成员持有（未确认），
+			// 要么已确认并完成转移（生效==目标，且目标不再是该成员）。
+			for memberID, set := range g.revokeRequired {
+				if _, alive := g.members[memberID]; !alive {
+					return errCorrupt("group %q revocation obligation belongs to non-member %q",
+						gs.Name, memberID)
+				}
+				ackedSet := g.revokeAcked[memberID]
+				for p := range set {
+					if _, isAcked := ackedSet[p]; isAcked {
+						eff, tgt := g.assignment.Owners[p], g.target.Owners[p]
+						if eff != tgt || tgt == memberID {
+							return errCorrupt("group %q partition %d acked by %q but not transferred (eff=%q tgt=%q)",
+								gs.Name, p, memberID, eff, tgt)
+						}
+						continue
+					}
+					if inFlight[p] != memberID {
+						return errCorrupt("group %q partition %d not in flight from %q but in its revocation set",
+							gs.Name, p, memberID)
+					}
+				}
+			}
+		}
+
 		for i := range gs.Offsets {
 			o := gs.Offsets[i]
 			g.offsets[o.Partition] = &o
@@ -165,4 +303,20 @@ func sortOffsets(o []Offset) {
 
 func sortRequests(r []RequestSnapshot) {
 	sort.Slice(r, func(i, j int) bool { return r[i].RequestID < r[j].RequestID })
+}
+
+func sortRevocations(r []RevocationSnapshot) {
+	sort.Slice(r, func(i, j int) bool { return r[i].MemberID < r[j].MemberID })
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }

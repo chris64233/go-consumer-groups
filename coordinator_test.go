@@ -58,7 +58,7 @@ func TestJoinProducesDeterministicAssignment(t *testing.T) {
 	}
 
 	r1 := mustJoin(t, c, "g", "charlie")
-	if r1.Generation != 1 || r1.Leader != "charlie" {
+	if r1.Generation != 1 || r1.Leader != "charlie" || r1.Phase != PhaseStable {
 		t.Fatalf("first join: %+v", r1)
 	}
 	want := []string{"charlie", "charlie", "charlie", "charlie", "charlie"}
@@ -66,23 +66,82 @@ func TestJoinProducesDeterministicAssignment(t *testing.T) {
 		t.Fatalf("gen 1 owners = %v, want %v", got, want)
 	}
 
-	// 乱序加入，但分配按成员 ID 字典序确定性产生。
-	mustJoin(t, c, "g", "alpha")
-	mustJoin(t, c, "g", "bravo")
+	// 乱序加入，但目标分配按成员 ID 字典序确定性产生。
+	mustJoin(t, c, "g", "alpha") // gen 2：撤销阶段
 	st, _ := c.Status("g")
-	if st.Generation != 3 {
-		t.Fatalf("generation after 3 joins = %d, want 3", st.Generation)
+	if st.Generation != 2 || st.Phase != PhaseRevoking {
+		t.Fatalf("gen 2 status: gen=%d phase=%s", st.Generation, st.Phase)
+	}
+	// 目标所有权立即发布：[alpha charlie alpha charlie alpha]。
+	if got := st.TargetAssignment.Owners; !equalStrings(got,
+		[]string{"alpha", "charlie", "alpha", "charlie", "alpha"}) {
+		t.Fatalf("gen 2 target = %v", got)
+	}
+	// 旧所有者确认撤销前，生效所有权仍是旧主 charlie，新主 alpha 拿不到分区。
+	if got := st.Assignment.Owners; !equalStrings(got, want) {
+		t.Fatalf("gen 2 effective owners before ack = %v, want %v", got, want)
+	}
+	if !equalInts(st.PendingRevocations["charlie"], []int{0, 2, 4}) {
+		t.Fatalf("charlie pending = %v", st.PendingRevocations["charlie"])
+	}
+	// charlie 确认撤销后版本在 gen 2 内收敛。
+	ack := mustAck(t, c, "g", "charlie", 2, []int{0, 2, 4})
+	if !ack.CompletedRebalance || ack.Phase != PhaseStable {
+		t.Fatalf("ack result = %+v", ack)
+	}
+	st, _ = c.Status("g")
+	if st.Phase != PhaseStable || !equalStrings(st.Assignment.Owners, st.TargetAssignment.Owners) {
+		t.Fatalf("gen 2 should be stable and converged: %+v", st)
+	}
+
+	mustJoin(t, c, "g", "bravo") // gen 3：再次进入撤销阶段
+	st, _ = c.Status("g")
+	if st.Generation != 3 || st.Phase != PhaseRevoking {
+		t.Fatalf("generation after 3 joins = %d, phase = %s", st.Generation, st.Phase)
 	}
 	// 排序后 [alpha bravo charlie]：分区 i -> members[i%3]
-	want = []string{"alpha", "bravo", "charlie", "alpha", "bravo"}
-	if got := st.Assignment.Owners; !equalStrings(got, want) {
-		t.Fatalf("gen 3 owners = %v, want %v", got, want)
+	wantTarget := []string{"alpha", "bravo", "charlie", "alpha", "bravo"}
+	if got := st.TargetAssignment.Owners; !equalStrings(got, wantTarget) {
+		t.Fatalf("gen 3 target = %v, want %v", got, wantTarget)
+	}
+	// 生效所有权来自 gen 2 稳定态 [alpha charlie alpha charlie alpha]，未受影响分区不动。
+	if got := st.Assignment.Owners; !equalStrings(got,
+		[]string{"alpha", "charlie", "alpha", "charlie", "alpha"}) {
+		t.Fatalf("gen 3 effective owners before ack = %v", got)
+	}
+	// 待撤销集合：alpha 交出 2、4；charlie 交出 1、3。
+	if !equalInts(st.PendingRevocations["alpha"], []int{2, 4}) {
+		t.Fatalf("alpha pending = %v", st.PendingRevocations["alpha"])
+	}
+	if !equalInts(st.PendingRevocations["charlie"], []int{1, 3}) {
+		t.Fatalf("charlie pending = %v", st.PendingRevocations["charlie"])
+	}
+	// 任一成员单独确认都不能提前完成整个再均衡。
+	if ack := mustAck(t, c, "g", "alpha", 3, []int{2, 4}); ack.CompletedRebalance {
+		t.Fatalf("rebalance must not complete before charlie acks: %+v", ack)
+	}
+	st, _ = c.Status("g")
+	if st.Phase != PhaseRevoking {
+		t.Fatalf("phase should stay revoking after partial ack")
+	}
+	// 分区 2、4 已转给目标所有者，1、3 仍由 charlie 持有。
+	if got := st.Assignment.Owners; !equalStrings(got,
+		[]string{"alpha", "charlie", "charlie", "charlie", "bravo"}) {
+		t.Fatalf("effective owners after alpha ack = %v", got)
+	}
+	mustAck(t, c, "g", "charlie", 3, []int{1, 3})
+	st, _ = c.Status("g")
+	if st.Phase != PhaseStable {
+		t.Fatalf("leader = %q", st.Leader)
+	}
+	if got := st.Assignment.Owners; !equalStrings(got, wantTarget) {
+		t.Fatalf("gen 3 final owners = %v, want %v", got, wantTarget)
 	}
 	if st.Leader != "charlie" { // 第一个加入者
 		t.Fatalf("leader = %q, want charlie", st.Leader)
 	}
 
-	// 每次 Join 返回的 Assignment 都是一份完整快照（同一版本内一分区一主）。
+	// 每次稳定后的 Assignment 都是一份完整快照（同一版本内一分区一主）。
 	if !assignmentIsExclusive(st.Assignment, 5) {
 		t.Fatalf("assignment violates exclusivity: %v", st.Assignment.Owners)
 	}
@@ -432,30 +491,54 @@ func TestCommitIdempotencyAndConflict(t *testing.T) {
 	}
 }
 
-// 再均衡后，旧所有者对新所有者分区的提交必须失败。
-func TestCommitRejectedAfterRebalance(t *testing.T) {
+// 协作式再均衡下的位点提交栅栏：待撤销分区在确认前旧主可提交最终位点；
+// 一旦确认转移完成，旧主的迟到提交必须失败，新主可以提交。
+func TestCommitFencingAcrossCooperativeRebalance(t *testing.T) {
 	c, _ := NewCoordinator(nil, nil)
 	_ = c.CreateGroup(CreateGroupOptions{Name: "g", Partitions: 2})
-	mustJoin(t, c, "g", "a") // gen 1: [a a]
+	mustJoin(t, c, "g", "a") // gen 1 stable: [a a]
 	if _, err := c.CommitOffset("g", CommitRequest{
 		MemberID: "a", Generation: 1, Partition: 1, Offset: 5, RequestID: "r1",
 	}); err != nil {
 		t.Fatal(err)
 	}
-	mustJoin(t, c, "g", "b") // gen 2: [a b]
-
-	// a 携带新版本提交分区 1：它已不是所有者。
-	_, err := c.CommitOffset("g", CommitRequest{
-		MemberID: "a", Generation: 2, Partition: 1, Offset: 6, RequestID: "r2",
-	})
-	if !errors.Is(err, ErrNotOwner) {
-		t.Fatalf("former owner commit should fail with ErrNotOwner, got %v", err)
+	jb := mustJoin(t, c, "g", "b") // gen 2 revoking: target [a b]，分区 1 待 a 撤销
+	if jb.Phase != PhaseRevoking {
+		t.Fatalf("join b phase = %s, want revoking", jb.Phase)
 	}
-	// b 成为新所有者，可以提交。
+
+	// 撤销确认前，分区 1 仍由 a 有效持有：a 携带当前版本可以提交最终位点。
 	if _, err := c.CommitOffset("g", CommitRequest{
-		MemberID: "b", Generation: 2, Partition: 1, Offset: 6, RequestID: "r3",
+		MemberID: "a", Generation: 2, Partition: 1, Offset: 6, RequestID: "r2",
 	}); err != nil {
-		t.Fatalf("new owner commit: %v", err)
+		t.Fatalf("old owner should commit final offset while pending revocation, got %v", err)
+	}
+	// 但新所有者 b 在 a 确认前尚不能取得分区 1，提交被所有权栅栏阻止。
+	if _, err := c.CommitOffset("g", CommitRequest{
+		MemberID: "b", Generation: 2, Partition: 1, Offset: 7, RequestID: "r3",
+	}); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("new owner commit before transfer should fail with ErrNotOwner, got %v", err)
+	}
+
+	// a 确认撤销，分区 1 转移给 b，版本收敛。
+	ack := mustAck(t, c, "g", "a", 2, []int{1})
+	if !ack.CompletedRebalance || ack.Phase != PhaseStable {
+		t.Fatalf("ack = %+v", ack)
+	}
+
+	// 转移完成后，旧主 a 的迟到提交（即使携带当前版本）必须被栅栏阻止。
+	_, err := c.CommitOffset("g", CommitRequest{
+		MemberID: "a", Generation: 2, Partition: 1, Offset: 8, RequestID: "r4",
+	})
+	noe := requireError[*NotPartitionOwnerError](t, err, ErrNotOwner)
+	if noe.Owner != "b" || noe.Member != "a" {
+		t.Fatalf("fence error fields = %+v", noe)
+	}
+	// 新所有者 b 现在可以提交，且从旧主提交的最终位点 6 之后继续。
+	if _, err := c.CommitOffset("g", CommitRequest{
+		MemberID: "b", Generation: 2, Partition: 1, Offset: 7, RequestID: "r5",
+	}); err != nil {
+		t.Fatalf("new owner commit after transfer: %v", err)
 	}
 	// a 用旧版本重试旧请求号：版本先拒绝，不会触碰幂等表。
 	_, err = c.CommitOffset("g", CommitRequest{
@@ -524,13 +607,40 @@ func TestConcurrentLeaveExpireHeartbeatVersionChain(t *testing.T) {
 	if len(st.Members) != 3 {
 		t.Fatalf("remaining members = %d, want 3", len(st.Members))
 	}
-	if !assignmentMatchesMembers(st.Assignment, st.MemberIDs()) {
-		t.Fatalf("final assignment inconsistent with members: owners=%v members=%v",
-			st.Assignment.Owners, st.MemberIDs())
+	// 目标所有权必须恰好是存活成员集合的确定性分配。
+	if !assignmentMatchesMembers(st.TargetAssignment, st.MemberIDs()) {
+		t.Fatalf("target inconsistent with members: target=%v members=%v",
+			st.TargetAssignment.Owners, st.MemberIDs())
+	}
+	// 生效所有权中每个非空所有者都必须仍是成员；与目标不同的槽位必须是
+	// 某存活成员的待撤销分区（新主确认前拿不到，未受影响分区保持原成员）。
+	memberSet := make(map[string]bool, len(st.Members))
+	for _, id := range st.MemberIDs() {
+		memberSet[id] = true
+	}
+	for p, eff := range st.Assignment.Owners {
+		if eff != "" && !memberSet[eff] {
+			t.Fatalf("effective owner %q of partition %d is no longer a member", eff, p)
+		}
+		if eff != st.TargetAssignment.Owners[p] {
+			found := false
+			for _, pending := range st.PendingRevocations[eff] {
+				if pending == p {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("partition %d in flight (%q -> %q) but not in %q pending set %v",
+					p, eff, st.TargetAssignment.Owners[p], eff, st.PendingRevocations[eff])
+			}
+		}
 	}
 
 	// 回放所有持久化快照：版本号严格按保存顺序单调不减（重入 Save 时相等），
-	// 且每次快照的 owners 恰好是当时成员集合的确定性分配。
+	// 每份快照都必须满足协作式再均衡不变量：
+	//   - 目标所有权恰好是当时成员集合的确定性分配；
+	//   - 生效所有者要么等于目标所有者，要么是仍存活、且该分区正处于其
+	//     待撤销集合中的旧成员（新主在确认前拿不到分区）。
 	records := store.records()
 	var prev int64
 	for i, rec := range records {
@@ -546,9 +656,20 @@ func TestConcurrentLeaveExpireHeartbeatVersionChain(t *testing.T) {
 		for id := range g.members {
 			ids = append(ids, id)
 		}
-		expected := planAssignment(g.generation, 8, membersFromIDs(ids, clk.Now()), clk.Now())
-		if !equalStrings(g.owners, expected.Owners) {
-			t.Fatalf("persisted owners gen=%d = %v, want %v", g.generation, g.owners, expected.Owners)
+		expectedTarget := planAssignment(g.generation, 8, membersFromIDs(ids, clk.Now()), clk.Now())
+		if !equalStrings(g.target, expectedTarget.Owners) {
+			t.Fatalf("persisted target gen=%d = %v, want %v", g.generation, g.target, expectedTarget.Owners)
+		}
+		for p, eff := range g.owners {
+			tgt := expectedTarget.Owners[p]
+			if eff == tgt {
+				continue // 未受影响 / 已移交 / 无主
+			}
+			// 在途分区：旧主必须仍是成员（离开/超时会被强制回收，不会停在在途状态）。
+			if !g.members[eff] {
+				t.Fatalf("gen=%d partition=%d in-flight effective owner %q not a member",
+					g.generation, p, eff)
+			}
 		}
 		prev = g.generation
 	}
@@ -598,6 +719,18 @@ func TestConcurrentCommitsKeepLargestOffset(t *testing.T) {
 // ---- 工具 ----
 
 func equalStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func equalInts(a, b []int) bool {
 	if len(a) != len(b) {
 		return false
 	}

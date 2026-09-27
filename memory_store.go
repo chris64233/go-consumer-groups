@@ -38,15 +38,18 @@ func cloneSnapshot(s *Snapshot) *Snapshot {
 	cp := &Snapshot{Groups: make([]GroupSnapshot, len(s.Groups))}
 	for i, g := range s.Groups {
 		ng := GroupSnapshot{
-			Name:           g.Name,
-			Partitions:     g.Partitions,
-			SessionTimeout: g.SessionTimeout,
-			Generation:     g.Generation,
-			Leader:         g.Leader,
-			LastRebalance:  g.LastRebalance,
-			Members:        make([]MemberSnapshot, len(g.Members)),
-			Assignment:     g.Assignment.clone(),
-			Offsets:        append([]Offset(nil), g.Offsets...),
+			Name:             g.Name,
+			Partitions:       g.Partitions,
+			SessionTimeout:   g.SessionTimeout,
+			Generation:       g.Generation,
+			Phase:            g.Phase,
+			Leader:           g.Leader,
+			LastRebalance:    g.LastRebalance,
+			Members:          make([]MemberSnapshot, len(g.Members)),
+			Assignment:       g.Assignment.clone(),
+			TargetAssignment: g.TargetAssignment.clone(),
+			Revocations:      make([]RevocationSnapshot, len(g.Revocations)),
+			Offsets:          append([]Offset(nil), g.Offsets...),
 		}
 		for j, m := range g.Members {
 			nm := MemberSnapshot{
@@ -56,6 +59,13 @@ func cloneSnapshot(s *Snapshot) *Snapshot {
 				Requests:        append([]RequestSnapshot(nil), m.Requests...),
 			}
 			ng.Members[j] = nm
+		}
+		for j, rv := range g.Revocations {
+			ng.Revocations[j] = RevocationSnapshot{
+				MemberID: rv.MemberID,
+				Required: append([]int(nil), rv.Required...),
+				Acked:    append([]int(nil), rv.Acked...),
+			}
 		}
 		cp.Groups[i] = ng
 	}

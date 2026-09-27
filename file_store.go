@@ -30,15 +30,24 @@ type fileSnapshot struct {
 }
 
 type fileGroupSnapshot struct {
-	Name           string             `json:"name"`
-	Partitions     int                `json:"partitions"`
-	SessionTimeout int64              `json:"session_timeout_ns"`
-	Generation     int64              `json:"generation"`
-	Leader         string             `json:"leader"`
-	LastRebalance  time.Time          `json:"last_rebalance"`
-	Members        []fileMemberSnap   `json:"members"`
-	Assignment     fileAssignmentSnap `json:"assignment"`
-	Offsets        []fileOffsetSnap   `json:"offsets"`
+	Name             string             `json:"name"`
+	Partitions       int                `json:"partitions"`
+	SessionTimeout   int64              `json:"session_timeout_ns"`
+	Generation       int64              `json:"generation"`
+	Phase            string             `json:"phase"`
+	Leader           string             `json:"leader"`
+	LastRebalance    time.Time          `json:"last_rebalance"`
+	Members          []fileMemberSnap   `json:"members"`
+	Assignment       fileAssignmentSnap `json:"assignment"`
+	TargetAssignment fileAssignmentSnap `json:"target_assignment"`
+	Revocations      []fileRevocation   `json:"revocations"`
+	Offsets          []fileOffsetSnap   `json:"offsets"`
+}
+
+type fileRevocation struct {
+	MemberID string `json:"member_id"`
+	Required []int  `json:"required"`
+	Acked    []int  `json:"acked"`
 }
 
 type fileMemberSnap struct {
@@ -70,7 +79,7 @@ type fileOffsetSnap struct {
 	LastRequestID string    `json:"last_request_id"`
 }
 
-const snapshotFormatVersion = 1
+const snapshotFormatVersion = 2
 
 // Save 原子写入整份快照。
 func (s *FileStore) Save(snap Snapshot) error {
@@ -135,6 +144,7 @@ func toFileSnapshot(s *Snapshot) fileSnapshot {
 			Partitions:     g.Partitions,
 			SessionTimeout: int64(g.SessionTimeout),
 			Generation:     g.Generation,
+			Phase:          string(g.Phase),
 			Leader:         g.Leader,
 			LastRebalance:  g.LastRebalance,
 			Members:        make([]fileMemberSnap, 0, len(g.Members)),
@@ -143,7 +153,13 @@ func toFileSnapshot(s *Snapshot) fileSnapshot {
 				CreatedAt:  g.Assignment.CreatedAt,
 				Owners:     append([]string(nil), g.Assignment.Owners...),
 			},
-			Offsets: make([]fileOffsetSnap, 0, len(g.Offsets)),
+			TargetAssignment: fileAssignmentSnap{
+				Generation: g.TargetAssignment.Generation,
+				CreatedAt:  g.TargetAssignment.CreatedAt,
+				Owners:     append([]string(nil), g.TargetAssignment.Owners...),
+			},
+			Revocations: make([]fileRevocation, 0, len(g.Revocations)),
+			Offsets:     make([]fileOffsetSnap, 0, len(g.Offsets)),
 		}
 		for _, m := range g.Members {
 			fm := fileMemberSnap{
@@ -162,6 +178,13 @@ func toFileSnapshot(s *Snapshot) fileSnapshot {
 				})
 			}
 			fg.Members = append(fg.Members, fm)
+		}
+		for _, rv := range g.Revocations {
+			fg.Revocations = append(fg.Revocations, fileRevocation{
+				MemberID: rv.MemberID,
+				Required: append([]int(nil), rv.Required...),
+				Acked:    append([]int(nil), rv.Acked...),
+			})
 		}
 		for _, o := range g.Offsets {
 			fg.Offsets = append(fg.Offsets, fileOffsetSnap{
@@ -185,6 +208,7 @@ func fromFileSnapshot(fs *fileSnapshot) *Snapshot {
 			Partitions:     fg.Partitions,
 			SessionTimeout: time.Duration(fg.SessionTimeout),
 			Generation:     fg.Generation,
+			Phase:          RebalancePhase(fg.Phase),
 			Leader:         fg.Leader,
 			LastRebalance:  fg.LastRebalance,
 			Members:        make([]MemberSnapshot, 0, len(fg.Members)),
@@ -193,7 +217,13 @@ func fromFileSnapshot(fs *fileSnapshot) *Snapshot {
 				CreatedAt:  fg.Assignment.CreatedAt,
 				Owners:     append([]string(nil), fg.Assignment.Owners...),
 			},
-			Offsets: make([]Offset, 0, len(fg.Offsets)),
+			TargetAssignment: Assignment{
+				Generation: fg.TargetAssignment.Generation,
+				CreatedAt:  fg.TargetAssignment.CreatedAt,
+				Owners:     append([]string(nil), fg.TargetAssignment.Owners...),
+			},
+			Revocations: make([]RevocationSnapshot, 0, len(fg.Revocations)),
+			Offsets:     make([]Offset, 0, len(fg.Offsets)),
 		}
 		for _, fm := range fg.Members {
 			m := MemberSnapshot{
@@ -212,6 +242,13 @@ func fromFileSnapshot(fs *fileSnapshot) *Snapshot {
 				})
 			}
 			g.Members = append(g.Members, m)
+		}
+		for _, fr := range fg.Revocations {
+			g.Revocations = append(g.Revocations, RevocationSnapshot{
+				MemberID: fr.MemberID,
+				Required: append([]int(nil), fr.Required...),
+				Acked:    append([]int(nil), fr.Acked...),
+			})
 		}
 		for _, fo := range fg.Offsets {
 			g.Offsets = append(g.Offsets, Offset{

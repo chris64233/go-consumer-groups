@@ -29,6 +29,12 @@ var (
 	ErrInvalidPartition = errors.New("invalid partition")
 	// ErrInvalidArgument 参数非法。
 	ErrInvalidArgument = errors.New("invalid argument")
+	// ErrNoRevocationInProgress 组当前处于 stable 阶段、没有待确认的撤销，
+	// 或成员在当前版本下没有任何撤销义务，撤销确认无的放矢。
+	ErrNoRevocationInProgress = errors.New("no revocation in progress")
+	// ErrRevocationMismatch 撤销确认的分区集合与协调器为该成员/版本计算出的
+	// 应撤销集合不精确相等（漏项或携带额外分区）。
+	ErrRevocationMismatch = errors.New("revocation acknowledgement partition set mismatch")
 )
 
 // GenerationMismatchError 在操作携带的分配版本与当前版本不一致时返回。
@@ -103,3 +109,23 @@ func (e *OffsetBacktrackError) Error() string {
 }
 
 func (e *OffsetBacktrackError) Is(target error) bool { return target == ErrOffsetBacktrack }
+
+// RevocationMismatchError 在撤销确认的分区集合与该成员本版本应撤销集合
+// 不精确相等时返回：Missing 为漏掉的分区，Extra 为多确认的分区。
+// errors.Is(err, ErrRevocationMismatch) 成立。
+type RevocationMismatchError struct {
+	Group    string
+	Member   string
+	WantGen  int64
+	Expected []int
+	Got      []int
+	Missing  []int
+	Extra    []int
+}
+
+func (e *RevocationMismatchError) Error() string {
+	return fmt.Sprintf("%s: group=%q member=%q generation=%d expected=%v got=%v missing=%v extra=%v",
+		ErrRevocationMismatch, e.Group, e.Member, e.WantGen, e.Expected, e.Got, e.Missing, e.Extra)
+}
+
+func (e *RevocationMismatchError) Is(target error) bool { return target == ErrRevocationMismatch }

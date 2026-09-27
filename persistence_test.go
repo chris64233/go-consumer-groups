@@ -21,8 +21,8 @@ func TestFileStorePersistenceAndRecovery(t *testing.T) {
 	if err := c.CreateGroup(CreateGroupOptions{Name: "g", Partitions: 3, SessionTimeout: 7 * time.Second}); err != nil {
 		t.Fatal(err)
 	}
-	mustJoin(t, c, "g", "a") // gen 1
-	mustJoin(t, c, "g", "b") // gen 2: owners [a b a]
+	mustJoin(t, c, "g", "a") // gen 1 stable: [a a a]
+	mustJoin(t, c, "g", "b") // gen 2 revoking: target [a b a]，分区 1 待 a 撤销
 	if _, err := c.CommitOffset("g", CommitRequest{
 		MemberID: "a", Generation: 2, Partition: 0, Offset: 42, Metadata: "m0", RequestID: "req-0",
 	}); err != nil {
@@ -36,7 +36,7 @@ func TestFileStorePersistenceAndRecovery(t *testing.T) {
 		t.Fatalf("state file should exist: %v", err)
 	}
 
-	// 模拟进程重启：用同一个文件新建协调器。
+	// 模拟进程重启：在撤销阶段中途崩溃后，用同一个文件新建协调器。
 	c2, err := NewCoordinator(NewFileStore(path), clk)
 	if err != nil {
 		t.Fatalf("recover: %v", err)
@@ -45,11 +45,18 @@ func TestFileStorePersistenceAndRecovery(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Generation != 2 {
-		t.Fatalf("recovered generation = %d, want 2", st.Generation)
+	if st.Generation != 2 || st.Phase != PhaseRevoking {
+		t.Fatalf("recovered gen=%d phase=%s, want gen 2 revoking", st.Generation, st.Phase)
 	}
-	if !equalStrings(st.Assignment.Owners, []string{"a", "b", "a"}) {
-		t.Fatalf("recovered owners = %v", st.Assignment.Owners)
+	// 生效所有权仍是旧主 [a a a]，目标所有权是 [a b a]，撤销进度完整还原。
+	if !equalStrings(st.Assignment.Owners, []string{"a", "a", "a"}) {
+		t.Fatalf("recovered effective owners = %v", st.Assignment.Owners)
+	}
+	if !equalStrings(st.TargetAssignment.Owners, []string{"a", "b", "a"}) {
+		t.Fatalf("recovered target owners = %v", st.TargetAssignment.Owners)
+	}
+	if !equalInts(st.PendingRevocations["a"], []int{1}) {
+		t.Fatalf("recovered pending revocations = %v", st.PendingRevocations)
 	}
 	if len(st.Offsets) != 1 || st.Offsets[0].Offset != 42 || st.Offsets[0].Metadata != "m0" {
 		t.Fatalf("recovered offsets = %+v", st.Offsets)
@@ -71,8 +78,33 @@ func TestFileStorePersistenceAndRecovery(t *testing.T) {
 		t.Fatalf("conflict after recovery should still be detected, got %v", err)
 	}
 
+	// 恢复后撤销流程可以继续：a 确认撤销分区 1，版本在 gen 2 内收敛。
+	ack, err := c2.AckRevocation("g", RevocationAckRequest{
+		MemberID: "a", Generation: 2, Partitions: []int{1},
+	})
+	if err != nil {
+		t.Fatalf("ack after recovery: %v", err)
+	}
+	if !ack.CompletedRebalance || ack.Phase != PhaseStable {
+		t.Fatalf("ack after recovery = %+v", ack)
+	}
+	st2, _ := c2.Status("g")
+	if !equalStrings(st2.Assignment.Owners, []string{"a", "b", "a"}) {
+		t.Fatalf("owners after recovered ack = %v", st2.Assignment.Owners)
+	}
+
+	// 再次重启：稳定态也能正确恢复（生效 == 目标，无撤销义务）。
+	c3, err := NewCoordinator(NewFileStore(path), clk)
+	if err != nil {
+		t.Fatalf("second recover: %v", err)
+	}
+	st3, _ := c3.Status("g")
+	if st3.Phase != PhaseStable || !equalStrings(st3.Assignment.Owners, []string{"a", "b", "a"}) {
+		t.Fatalf("stable recovery = %+v owners=%v", st3.Phase, st3.Assignment.Owners)
+	}
+
 	// 恢复后版本继续递增，不会与旧版本冲突。
-	r := mustJoin(t, c2, "g", "c")
+	r := mustJoin(t, c3, "g", "c")
 	if r.Generation != 3 {
 		t.Fatalf("generation after recovery join = %d, want 3", r.Generation)
 	}
