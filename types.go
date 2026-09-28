@@ -16,13 +16,36 @@ const (
 )
 
 // Member 是组内一个消费者成员的运行时状态。
+//
+// 动态成员（Static=false）以进程生成的成员 ID 标识，断线即被剔除；
+// 静态成员（Static=true）以稳定实例 ID 标识，其 ID 在多次会话间保持不变，
+// 会话版本（SessionVersion）单调递增用于栅栏旧进程，离线后在保留期内
+// 仍占用分区、仍作为成员参与分配。
 type Member struct {
-	// ID 成员唯一标识。
+	// ID 成员唯一标识；静态成员即其实例 ID，跨多次会话保持不变。
 	ID string
-	// JoinedAt 加入时间（单调时钟读数，用于审计/展示）。
+	// JoinedAt 该身份首次加入时间（静态成员重连/接管不刷新，用于 leader 年资排序）。
 	JoinedAt time.Time
-	// LastHeartbeatAt 最近一次被当前版本接受的心跳时间。
+	// LastHeartbeatAt 最近一次被当前会话接受的心跳时间。
 	LastHeartbeatAt time.Time
+
+	// Static 为 true 表示静态成员（稳定实例身份 + 会话版本 + 离线保留期）。
+	Static bool
+	// Online 当前是否有活跃会话在线。静态成员离线保留期内为 false，但身份与
+	// 分区所有权都保留；动态成员恒为 true（在组期间）。
+	Online bool
+	// SessionVersion 当前会话版本。静态成员每次成功加入获得一个严格递增的
+	// 新版本；旧进程携带更小版本发起的心跳/撤销确认/位点提交一律被栅栏拒绝。
+	// 动态成员为 0。
+	SessionVersion int64
+	// OfflineAt 静态成员进入离线保留期的时间；在线时为零值。
+	OfflineAt time.Time
+	// RetainUntil 离线保留截止时间：超过该时刻仍未重连，实例被清退，
+	// 其分区才纳入协作式再均衡。在线时为零值。
+	RetainUntil time.Time
+	// OwnedPartitions 当前生效所有权下该成员持有的全部分区（升序）。
+	// 离线静态成员据此可查到保留期内仍由其占用、到期才会转移的分区。
+	OwnedPartitions []int
 }
 
 // Assignment 是某个分配版本下「分区 -> 成员」的完整快照。
@@ -65,10 +88,17 @@ type GroupStatus struct {
 	Generation int64
 	// Phase 组在版本状态机上的当前阶段（stable / revoking）。
 	Phase RebalancePhase
-	// Leader 第一个加入组的成员；它退出后由当前存活成员中加入最早者接任，
-	// 为空表示组内没有成员。
+	// Leader 第一个加入组的成员；它退出后由当前在线成员中加入最早者接任，
+	// 为空表示组内没有在线成员（离线保留期内的静态实例不计）。
 	Leader  string
 	Members []Member
+	// StaticInstances 组内全部静态实例的查询视图（含保留期内暂时离线的实例），
+	// 按实例 ID 升序。动态成员不在此列。
+	StaticInstances []StaticInstanceStatus
+	// PendingTransfers 处于「离线保留期」的静态实例仍占有的分区批次：
+	// 这些分区在实例重连后继续由其消费；超过保留期未重连才会被清退并
+	// 作为一个整批转移给唯一的新所有者。按实例 ID 升序。
+	PendingTransfers []PendingTransfer
 	// Assignment 当前生效的所有权快照。协作式再均衡期间它只包含「已经可以
 	// 消费」的分区：未受影响分区保持原成员，待撤销分区仍是旧所有者，
 	// 新分配的分区在旧所有者确认撤销前不会出现在这里。
@@ -98,12 +128,51 @@ type RevocationProgress struct {
 	Done bool
 }
 
+// StaticInstanceStatus 是一个静态实例（稳定成员身份）的查询视图。
+type StaticInstanceStatus struct {
+	// InstanceID 稳定实例标识，跨多次会话不变，也是成员 ID。
+	InstanceID string
+	// Online 当前是否有活跃会话在线；false 表示处于离线保留期内。
+	Online bool
+	// SessionVersion 当前（最近一次成功加入的）会话版本。
+	SessionVersion int64
+	// JoinedAt 该实例身份首次加入组的时间。
+	JoinedAt time.Time
+	// LastHeartbeatAt 当前会话最近一次被接受的心跳时间（离线时为断线前最后一次）。
+	LastHeartbeatAt time.Time
+	// OfflineAt 进入离线保留期的时间；在线时为零值。
+	OfflineAt time.Time
+	// RetainUntil 保留截止时间；在线时为零值。
+	RetainUntil time.Time
+	// OwnedPartitions 当前生效所有权下该实例仍占有的分区（升序）：
+	// 在线时是其正在消费的分区，离线保留期内是其暂存、到期才会整批转移的分区。
+	OwnedPartitions []int
+}
+
+// PendingTransfer 描述一个离线保留期内的静态实例所占有的分区批次。
+// 超过保留期（或主动退出/管理员移除）后，该批分区在同一次再均衡中
+// 只能整体转移给一个新的目标所有者。
+type PendingTransfer struct {
+	// InstanceID 暂时离线的静态实例 ID。
+	InstanceID string
+	// Partitions 该实例仍占有的整批分区（升序）。
+	Partitions []int
+	// RetainUntil 保留截止时间；扫描时刻超过它，该批分区才会被清退转移。
+	RetainUntil time.Time
+	// OfflineAt 进入离线保留期的时间。
+	OfflineAt time.Time
+}
+
 // RevocationAckRequest 是一次撤销确认请求。
 type RevocationAckRequest struct {
 	// MemberID 确认撤销的成员。
 	MemberID string
 	// Generation 成员执行撤销所针对的分配版本，必须与协调器当前版本严格一致。
 	Generation int64
+	// SessionVersion 静态成员当前会话版本，必须与该实例登记的当前会话版本
+	// 严格一致；旧进程（较小版本）的确认会被栅栏拒绝，即使它携带了正确的
+	// 分配版本，也不能确认新会话版本下的撤销集合。动态成员传 0。
+	SessionVersion int64
 	// Partitions 成员本次确认已停止消费、可以移交的分区集合。
 	// 必须与其在该版本下应撤销的集合**精确相等**：漏项、额外分区或确认一个
 	// 不属于自己撤销义务的分区都会被拒绝。空集合（或 nil）表示成员在本版本
@@ -131,6 +200,12 @@ type JoinResult struct {
 	// Phase 加入后组所处阶段。
 	Phase  RebalancePhase
 	Leader string
+	// SessionVersion 本次加入获得的会话版本。静态成员每次成功加入严格递增；
+	// 动态成员为 0。后续心跳/撤销确认/位点提交都必须回传它。
+	SessionVersion int64
+	// Reconnected 为 true 表示这是静态实例在保留期内以更高会话版本重连：
+	// 协调器未推进分配版本，新会话直接继续原分配（离线期间分区未被转移）。
+	Reconnected bool
 	// Assignment 当前生效所有权快照。
 	Assignment Assignment
 	// TargetAssignment 本版本的目标所有权快照；Phase=stable 时与 Assignment 一致。
@@ -140,8 +215,14 @@ type JoinResult struct {
 // HeartbeatResult 是心跳的返回值。
 type HeartbeatResult struct {
 	Generation int64
+	// SessionVersion 该成员当前会话版本（静态成员重连后递增），
+	// 供客户端核对并在后续请求中回传。
+	SessionVersion int64
 	// Phase 组当前阶段。
 	Phase RebalancePhase
+	// Online 发送心跳的会话是否仍是该实例的当前会话（恒为 true——
+	// 旧会话的心跳在栅栏处直接被拒，不会返回成功结果）。
+	Online bool
 	// Assignment 当前生效所有权快照，客户端可据此核对本地视图。
 	Assignment Assignment
 	// TargetAssignment 本版本的目标所有权；撤销阶段与 Assignment 可能不同。
@@ -165,9 +246,35 @@ type CreateGroupOptions struct {
 	Name string
 	// Partitions 主题固定分区数，必须 > 0。
 	Partitions int
-	// SessionTimeout 会话超时：成员超过该时长未发送有效心跳即会被
-	// 超时扫描剔除。<= 0 时使用默认值。
+	// SessionTimeout 会话超时：在线成员超过该时长未发送有效心跳即会被
+	// 判定为断线（静态成员进入离线保留期，动态成员直接剔除）。<= 0 时使用默认值。
 	SessionTimeout time.Duration
+	// StaticRetention 静态成员离线保留期：静态实例断线后在此期限内以更高会话
+	// 版本重连可继续原分配，不转移分区；超过该期限才被清退并把整批分区
+	// 纳入协作式再均衡。<= 0 时使用默认值。
+	StaticRetention time.Duration
+}
+
+// JoinOptions 是一次加入组请求。
+type JoinOptions struct {
+	// Group 组名，必填。
+	Group string
+	// MemberID 成员标识。
+	// 动态成员：进程生成的临时 ID，断线即被剔除。
+	// 静态成员：稳定实例 ID（Static=true），跨进程重启保持不变。
+	MemberID string
+	// Static 为 true 时以静态成员身份加入：启用会话版本栅栏与离线保留期。
+	Static bool
+	// SessionVersion 客户端期望使用的会话版本，仅静态成员有意义：
+	//   - 首次加入传 0（或 <=0），协调器分配初始会话版本 1；
+	//   - 重连接管必须传严格大于当前会话版本的值（同一实例两个进程并发加入时，
+	//     只有版本更高者成为当前会话）；
+	//   - 传一个不大于当前会话版本的值返回 ErrStaleSession，无法抢占当前会话。
+	// 动态成员忽略该字段（恒为 0）。
+	SessionVersion int64
+	// Retention 仅静态成员有效：本次身份使用的离线保留期；<= 0 使用组默认值。
+	// 重连时可调整（续期/缩短），对当前及之后的离线周期生效。
+	Retention time.Duration
 }
 
 // CommitRequest 是一次位点提交请求。
@@ -178,6 +285,9 @@ type CommitRequest struct {
 	MemberID string
 	// Generation 成员持有的分配版本，与协调器不一致则拒绝。
 	Generation int64
+	// SessionVersion 静态成员当前会话版本，与 JoinMember 返回值严格一致；
+	// 旧进程（较小版本）或离线保留期内的提交返回 ErrStaleSession。动态成员传 0。
+	SessionVersion int64
 	// Partition 目标分区编号，范围 [0, 主题分区数)。
 	Partition int
 	// Offset 待提交位点，默认不得小于已存位点。

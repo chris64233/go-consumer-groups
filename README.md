@@ -1,7 +1,8 @@
 # go-consumer-groups
 
 基于**递增分配版本（generation）+ 协作式（cooperative）两阶段再均衡**的消费组
-协调器：管理组成员、确定性分区分配、协作式分区移交、会话超时与位点提交，
+协调器：管理组成员、确定性分区分配、协作式分区移交、会话超时、**静态成员身份
+（static membership：稳定实例标识 + 会话版本 + 离线保留期）**与位点提交，
 并把全部协调状态持久化到磁盘。
 
 开发环境：Go 1.23.0。
@@ -78,7 +79,58 @@ generation 内**收敛为 `stable`（收敛本身不再增加版本号）。
 - 撤销阶段心跳同样被接受（成员一边继续消费未受影响分区、一边等待撤销确认），
   返回值带回当前生效所有权、目标所有权与该成员尚待撤销的分区；心跳不推进状态机。
 - 成员超过 `SessionTimeout` 未发送有效心跳，会被 `ExpireGroup` / `ExpireAll`
-  超时扫描剔除并触发再均衡；其名下分区（含尚待撤销的分区）被强制回收。
+  超时扫描处理：动态成员直接剔除，静态成员转入离线保留期（见下）。
+
+### 静态成员：稳定实例身份、会话版本与离线保留期
+
+`JoinMember(JoinOptions{Static: true, ...})` 让消费者以**稳定实例 ID**（如
+`pod 名 / host 名`，跨进程重启保持不变）加入组，而不是用一次性进程 ID。
+静态成员在普通协作式再均衡之上多了两层机制：
+
+**会话版本（session version）栅栏**
+
+- 静态成员每次成功加入都获得一个**严格递增**的会话版本：首次加入传
+  `SessionVersion: 0` 时协调器分配 `1`；之后重连/接管由客户端提供**更高**的值。
+- 同一实例的两个进程并发加入时，**只有会话版本更高者成为当前会话**；
+  传入不高于当前版本的值立即得到 `ErrStaleSession`，不会有两个当前会话并存。
+- 旧进程（较小会话版本）随后的**心跳、撤销确认、位点提交一律被栅栏拒绝**
+  （`ErrStaleSession`）——即使它仍携带正确的分配版本：
+  - 不能替新会话确认**新版本的撤销集合**；
+  - 不能在新会话提交位点后把位点改回旧值；
+  - 实例离线保留期内（尚无当前会话）任何会话的请求同样被拒。
+- 心跳（`HeartbeatSession`）、撤销确认、位点提交都要回传 `SessionVersion`；
+  动态成员传 `0`（`Heartbeat` / 不带会话版本的便捷调用等价于 0）。
+
+**短暂重连不转移分区（离线保留期 retention）**
+
+- 静态实例会话超时后，协调器把它标记为「暂时离线」并进入**保留期**
+  （`CreateGroupOptions.StaticRetention`，重连时也可调整）：
+  **不推进分配版本、不触发再均衡，它名下的分区原样保留。**
+- 保留期内以更高会话版本重连（`JoinMember`）：分配版本不变、分区零转移，
+  返回 `Reconnected=true`，新会话直接继续原分配；若断线前正处在撤销阶段，
+  挂起的撤销义务仍在，由**新会话**确认后版本在同一 generation 内收敛。
+- 保留期内即使有其他成员加入/离开，离线实例的分区也被**锚定**：既不参与
+  轮询重排，也不会被分给别人（没有在线会话能替它确认撤销）。
+- 协调器据此区分「暂时离线」与「真正退出」；只有以下三种情况才真正清退静态
+  实例，并把它名下分区纳入一次协作式再均衡：
+  1. **超过保留期**仍未重连（`ExpireGroup` / `ExpireAll` 扫描到 `now > RetainUntil`）；
+  2. **主动退出**（`Leave`）；
+  3. **被管理员移除**（`RemoveMember`）。
+- 清退时该实例名下的分区构成一个**整批**，在本次再均衡中**只能转移给同一个
+  新所有者**（在线存活者中当前持有分区数最少、并列时 ID 最小者），不会被拆散
+  给多个成员；没有在线存活者时整批回到无主，等待后续加入者领取。
+
+> 动态成员（`Join` 或 `Static:false`）行为与之前完全一致：会话超时即剔除、
+> 立即强制回收分区。同一成员 ID 不能在动态/静态两种身份间切换，否则返回
+> `ErrStaticIdentityConflict`。
+
+**并发安全（接管 × 最终位点提交 × 超时扫描）**
+
+所有操作在同一把锁内串行，并叠加「会话版本栅栏 + 位点单调 + 生效所有权栅栏」：
+新会话接管、旧会话提交最终位点、超时扫描即使并发相撞，也只会有一个当前会话；
+旧会话无法让位点倒退，也无法确认新会话版本下的撤销集合。静态成员的幂等请求号
+记录按**实例身份**跨重连保留，因此新会话可以安全重放旧会话已受理的请求号，
+而旧会话自己重放则先被会话栅栏拒绝。
 
 ### 位点提交与所有权栅栏
 
@@ -108,28 +160,41 @@ generation 内**收敛为 `stable`（收敛本身不再增加版本号）。
 | `TargetAssignment` | 本版本的**目标**所有权；稳定时与 `Assignment` 一致 |
 | `PendingRevocations` | 各成员**仍待确认**撤销的分区集合 |
 | `RevocationProgress` | 各成员的应撤销（`Required`）/ 已确认（`Acked`）/ 是否完成（`Done`） |
-| `Members` / `Leader` / `Offsets` | 成员、leader、已提交位点 |
+| `Members` / `Leader` / `Offsets` | 成员（`Member` 含 `Static`/`Online`/`SessionVersion`/`OfflineAt`/`RetainUntil`/`OwnedPartitions`）、leader、已提交位点 |
+| `StaticInstances` | 全部静态实例视图：实例身份、在线状态、当前会话版本、保留期限、占有分区 |
+| `PendingTransfers` | 离线保留期内静态实例仍占有的分区批次：实例、分区、`OfflineAt`/`RetainUntil` |
+
+`Member` 的静态成员相关字段：`Static`（是否静态）、`Online`（当前是否有活跃
+会话）、`SessionVersion`（当前会话版本）、`OfflineAt`/`RetainUntil`（离线保留
+起止，在线时为零值）、`OwnedPartitions`（当前生效所有权下持有的分区）。
 
 ### 持久化
 
 `Store` 接口抽象状态持久化，每次状态变更后整体写入一份快照，快照内容包括：
-版本号、阶段、成员、生效所有权、目标所有权、各成员撤销义务与确认进度、位点、
-幂等记录。
+版本号、阶段、成员（含静态身份/在线状态/会话版本/保留期限）、生效所有权、
+目标所有权、各成员撤销义务与确认进度、位点、幂等记录。
 
-- `FileStore`：JSON 单文件（快照格式版本 2），写入采用「临时文件 + fsync +
+- `FileStore`：JSON 单文件（快照格式版本 3），写入采用「临时文件 + fsync +
   原子 rename」，读回时要么看到上一整份快照、要么看到新整份快照，不会读到半成品；
 - `MemoryStore`：内存实现（默认），用于测试或无需跨进程持久化的场景。
 
 进程重启后用同一 `Store` 重建 `Coordinator` 即可恢复——**包括撤销阶段中途的
-状态**：恢复后旧成员仍可继续确认撤销、版本在同一 generation 内收敛。加载时会
-做跨字段一致性校验（阶段、生效/目标所有权、撤销义务、存活成员之间必须自洽），
-损坏的快照直接报错而不是带病运行。
+状态**：恢复后旧成员仍可继续确认撤销、版本在同一 generation 内收敛。静态成员的
+实例身份、会话版本、离线保留期限与所有权关系同样持久化：在离线保留期内重启，
+恢复后实例仍是「暂时离线」，保留期内以更高会话版本重连仍可继续原分配、继续
+未完成的协作式再均衡。加载时会做跨字段一致性校验（阶段、生效/目标所有权、
+撤销义务、存活/在线成员、leader 之间必须自洽），损坏的快照直接报错而不是带病
+运行。
 
 ## 典型流程
 
 ```go
 c, _ := consumergroups.NewCoordinator(consumergroups.NewFileStore("state.json"), nil)
-c.CreateGroup(consumergroups.CreateGroupOptions{Name: "orders", Partitions: 8, SessionTimeout: 10 * time.Second})
+c.CreateGroup(consumergroups.CreateGroupOptions{
+    Name: "orders", Partitions: 8,
+    SessionTimeout:  10 * time.Second,
+    StaticRetention: 5 * time.Minute, // 静态实例短暂断线的分区保留期
+})
 
 // consumer-1 首次加入：无主分区立即取得，版本 stable
 j1, _ := c.Join("orders", "consumer-1")
@@ -151,26 +216,71 @@ ack, _ := c.AckRevocation("orders", consumergroups.RevocationAckRequest{
 // consumer-2 在下一次心跳中看到分区已生效归自己，开始消费
 ```
 
+静态成员的短暂重连（进程重启 / Pod 重建）：
+
+```go
+// worker-7 首次以稳定实例 ID 加入；协调器分配会话版本 1。
+j, _ := c.JoinMember(consumergroups.JoinOptions{
+    Group: "orders", MemberID: "worker-7", Static: true, SessionVersion: 0,
+})
+sess := j.SessionVersion // 1，后续心跳/确认/提交都回传它
+
+// 进程崩溃，会话超时后 worker-7 进入离线保留期：分区保留、分配版本不变。
+
+// 新进程在保留期内用【更高】会话版本重连：继续原分配，Reconnected=true。
+rj, _ := c.JoinMember(consumergroups.JoinOptions{
+    Group: "orders", MemberID: "worker-7", Static: true, SessionVersion: sess+1,
+})
+// rj.Reconnected == true，rj.Generation == j.Generation，分区零转移
+
+// 心跳 / 撤销确认 / 位点提交都要带新的 SessionVersion；旧进程带 sess 会被栅栏拒绝。
+c.HeartbeatSession("orders", consumergroups.HeartbeatRequest{
+    MemberID: "worker-7", Generation: rj.Generation, SessionVersion: rj.SessionVersion,
+})
+```
+
 ## API 一览
 
 ```go
 // 组管理
-c.CreateGroup(consumergroups.CreateGroupOptions{Name: "orders", Partitions: 8, SessionTimeout: 10 * time.Second})
-st, _ := c.Status("orders")     // 完整状态：生效/目标所有权、待撤销集合、确认进度、位点
+c.CreateGroup(consumergroups.CreateGroupOptions{
+    Name: "orders", Partitions: 8,
+    SessionTimeout:  10 * time.Second,
+    StaticRetention: 5 * time.Minute,
+})
+st, _ := c.Status("orders")     // 完整状态：生效/目标所有权、静态实例、待转移分区等
 names := c.Groups()             // 所有组名
 
-// 成员生命周期
-join, _ := c.Join("orders", "consumer-1")                 // 新版本 + 生效/目标所有权
-hb, _ := c.Heartbeat("orders", "consumer-1", join.Generation) // 返回阶段与待撤销分区
-ack, _ := c.AckRevocation("orders", consumergroups.RevocationAckRequest{
-    MemberID: "consumer-1", Generation: join.Generation, Partitions: hb.Revoking,
-})
+// 成员生命周期（动态）
+join, _ := c.Join("orders", "consumer-1")                    // 动态加入
+hb, _ := c.Heartbeat("orders", "consumer-1", join.Generation) // 动态心跳（会话版本 0）
 c.Leave("orders", "consumer-1")
-expired, _ := c.ExpireGroup("orders", time.Now())          // 或 c.ExpireAll(now) 周期扫描
 
-// 位点提交（只允许当前生效所有者）
+// 成员生命周期（静态：稳定实例身份 + 会话版本 + 离线保留期）
+sj, _ := c.JoinMember(consumergroups.JoinOptions{
+    Group: "orders", MemberID: "worker-7", Static: true, SessionVersion: 0, // 首次=>版本 1
+})
+// 保留期内以更高版本重连：sj2.Reconnected==true，分配版本/分区不变
+sj2, _ := c.JoinMember(consumergroups.JoinOptions{
+    Group: "orders", MemberID: "worker-7", Static: true, SessionVersion: sj.SessionVersion + 1,
+})
+shb, _ := c.HeartbeatSession("orders", consumergroups.HeartbeatRequest{
+    MemberID: "worker-7", Generation: sj2.Generation, SessionVersion: sj2.SessionVersion,
+})
+c.Leave("orders", "worker-7")       // 静态成员主动退出：立即清退（不等保留期）
+c.RemoveMember("orders", "worker-7") // 管理员移除：语义同主动退出
+
+expired, _ := c.ExpireGroup("orders", time.Now()) // 或 c.ExpireAll(now) 周期扫描
+
+// 撤销确认（静态成员回传 SessionVersion，动态成员传 0/省略）
+ack, _ := c.AckRevocation("orders", consumergroups.RevocationAckRequest{
+    MemberID: "worker-7", Generation: sj2.Generation,
+    SessionVersion: sj2.SessionVersion, Partitions: shb.Revoking,
+})
+
+// 位点提交（只允许当前生效所有者 + 当前会话版本）
 res, err := c.CommitOffset("orders", consumergroups.CommitRequest{
-    MemberID: "consumer-1", Generation: join.Generation,
+    MemberID: "worker-7", Generation: sj2.Generation, SessionVersion: sj2.SessionVersion,
     Partition: 0, Offset: 1024, RequestID: "commit-0001",
 })
 ```
@@ -183,6 +293,8 @@ res, err := c.CommitOffset("orders", consumergroups.CommitRequest{
 | 哨兵错误 | 结构化类型 | 含义 |
 | --- | --- | --- |
 | `ErrIllegalGeneration` | `*GenerationMismatchError` | 携带的分配版本与当前版本不一致（含 `Want`/`Got`）；旧版本心跳/提交/撤销确认一律拒绝 |
+| `ErrStaleSession` | `*StaleSessionError` | 静态成员的旧会话（已被更高会话版本接管，或实例离线保留期内）发起的心跳/确认/提交；字段 `Want`/`Got`/`Offline` |
+| `ErrStaticIdentityConflict` | — | 同一成员 ID 已以另一种身份类型（动态/静态）在组内 |
 | `ErrNotOwner` | `*NotPartitionOwnerError` | 提交者不是该分区当前生效所有者（转移后旧主被栅栏） |
 | `ErrRevocationMismatch` | `*RevocationMismatchError` | 撤销确认集合与应撤销集合不精确相等（含 `Expected`/`Missing`/`Extra`） |
 | `ErrNoRevocationInProgress` | — | 稳定阶段或成员无撤销义务时的撤销确认 |
@@ -203,8 +315,8 @@ if errors.As(err, &rm) {
 
 | 文件 | 职责 |
 | --- | --- |
-| `coordinator.go` | 协调器：版本状态机、加入/心跳/离开/超时/撤销确认/提交/查询，锁内串行化 |
-| `assign.go` | 确定性分区分配与 leader 选举 |
+| `coordinator.go` | 协调器：版本状态机、动态/静态加入/心跳/离开/移除/超时/撤销确认/提交/查询，锁内串行化；静态成员会话栅栏与离线保留期 |
+| `assign.go` | 确定性分区分配、静态离线分区锚定与静态成员清退的整批单目标转移、leader 选举 |
 | `types.go` | 对外类型：`Assignment`、`GroupStatus`、`RevocationAckRequest`、`CommitRequest` 等 |
 | `errors.go` | 哨兵错误与结构化错误类型 |
 | `store.go` | `Store` 接口、快照模型与恢复时的一致性校验 |

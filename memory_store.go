@@ -41,6 +41,7 @@ func cloneSnapshot(s *Snapshot) *Snapshot {
 			Name:             g.Name,
 			Partitions:       g.Partitions,
 			SessionTimeout:   g.SessionTimeout,
+			StaticRetention:  g.StaticRetention,
 			Generation:       g.Generation,
 			Phase:            g.Phase,
 			Leader:           g.Leader,
@@ -57,6 +58,11 @@ func cloneSnapshot(s *Snapshot) *Snapshot {
 				JoinedAt:        m.JoinedAt,
 				LastHeartbeatAt: m.LastHeartbeatAt,
 				Requests:        append([]RequestSnapshot(nil), m.Requests...),
+				Static:          m.Static,
+				Online:          m.Online,
+				SessionVersion:  m.SessionVersion,
+				OfflineAt:       m.OfflineAt,
+				RetainUntil:     m.RetainUntil,
 			}
 			ng.Members[j] = nm
 		}

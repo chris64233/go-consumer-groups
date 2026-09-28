@@ -17,7 +17,9 @@ type GroupSnapshot struct {
 	Name           string
 	Partitions     int
 	SessionTimeout time.Duration
-	Generation     int64
+	// StaticRetention 静态成员离线保留期。
+	StaticRetention time.Duration
+	Generation      int64
 	// Phase 版本状态机当前阶段（stable / revoking）。
 	Phase         RebalancePhase
 	Leader        string
@@ -47,6 +49,15 @@ type MemberSnapshot struct {
 	JoinedAt        time.Time
 	LastHeartbeatAt time.Time
 	Requests        []RequestSnapshot
+	// Static 是否为静态成员（稳定实例身份 + 会话版本 + 离线保留期）。
+	Static bool
+	// Online 是否有活跃会话；静态成员离线保留期内为 false 但身份仍在。
+	Online bool
+	// SessionVersion 当前会话版本；静态成员严格递增，动态成员为 0。
+	SessionVersion int64
+	// OfflineAt / RetainUntil 静态成员离线保留期起止；在线时为零值。
+	OfflineAt   time.Time
+	RetainUntil time.Time
 }
 
 // RequestSnapshot 是一条幂等请求记录的持久化状态。
@@ -88,7 +99,15 @@ func (c *Coordinator) snapshotLocked() Snapshot {
 			}
 			sortRequests(reqs)
 			members = append(members, MemberSnapshot{
-				ID: id, JoinedAt: m.joinedAt, LastHeartbeatAt: m.lastHeartbeatAt, Requests: reqs,
+				ID:              id,
+				JoinedAt:        m.joinedAt,
+				LastHeartbeatAt: m.lastHeartbeatAt,
+				Requests:        reqs,
+				Static:          m.static,
+				Online:          m.online,
+				SessionVersion:  m.sessionVersion,
+				OfflineAt:       m.offlineAt,
+				RetainUntil:     m.retainUntil,
 			})
 		}
 		sortMembers(members)
@@ -113,6 +132,7 @@ func (c *Coordinator) snapshotLocked() Snapshot {
 			Name:             g.name,
 			Partitions:       g.partitions,
 			SessionTimeout:   g.sessionTimeout,
+			StaticRetention:  g.staticRetention,
 			Generation:       g.generation,
 			Phase:            g.phase,
 			Leader:           g.leader,
@@ -134,20 +154,24 @@ func (c *Coordinator) restore(snap *Snapshot) error {
 			return errCorrupt("group %q has non-positive partition count %d", gs.Name, gs.Partitions)
 		}
 		g := &group{
-			name:           gs.Name,
-			partitions:     gs.Partitions,
-			sessionTimeout: gs.SessionTimeout,
-			generation:     gs.Generation,
-			phase:          gs.Phase,
-			leader:         gs.Leader,
-			lastRebalance:  gs.LastRebalance,
-			members:        make(map[string]*member, len(gs.Members)),
-			offsets:        make(map[int]*Offset, len(gs.Offsets)),
-			assignment:     gs.Assignment.clone(),
-			target:         gs.TargetAssignment.clone(),
+			name:            gs.Name,
+			partitions:      gs.Partitions,
+			sessionTimeout:  gs.SessionTimeout,
+			staticRetention: gs.StaticRetention,
+			generation:      gs.Generation,
+			phase:           gs.Phase,
+			leader:          gs.Leader,
+			lastRebalance:   gs.LastRebalance,
+			members:         make(map[string]*member, len(gs.Members)),
+			offsets:         make(map[int]*Offset, len(gs.Offsets)),
+			assignment:      gs.Assignment.clone(),
+			target:          gs.TargetAssignment.clone(),
 		}
 		if g.phase != PhaseStable && g.phase != PhaseRevoking {
 			return errCorrupt("group %q has unknown phase %q", gs.Name, gs.Phase)
+		}
+		if g.staticRetention <= 0 {
+			g.staticRetention = DefaultStaticRetention
 		}
 		if g.assignment.Owners == nil {
 			g.assignment.Owners = make([]string, gs.Partitions)
@@ -205,10 +229,37 @@ func (c *Coordinator) restore(snap *Snapshot) error {
 		}
 
 		for _, ms := range gs.Members {
+			// 动态成员没有离线保留态：持久化字段即使缺失（零值）也按在线处理。
+			if !ms.Static {
+				ms.Online = true
+			}
+			if ms.Static && ms.SessionVersion <= 0 {
+				return errCorrupt("group %q static member %q has non-positive session version %d",
+					gs.Name, ms.ID, ms.SessionVersion)
+			}
+			if !ms.Static {
+				if ms.SessionVersion != 0 || !ms.OfflineAt.IsZero() || !ms.RetainUntil.IsZero() {
+					return errCorrupt("group %q dynamic member %q carries static session fields",
+						gs.Name, ms.ID)
+				}
+			} else if !ms.Online {
+				if ms.RetainUntil.IsZero() || ms.OfflineAt.IsZero() {
+					return errCorrupt("group %q offline static member %q missing offline/retain timestamps",
+						gs.Name, ms.ID)
+				}
+			} else if !ms.OfflineAt.IsZero() || !ms.RetainUntil.IsZero() {
+				return errCorrupt("group %q online static member %q carries offline timestamps",
+					gs.Name, ms.ID)
+			}
 			m := &member{
 				id:              ms.ID,
+				static:          ms.Static,
+				online:          ms.Online,
+				sessionVersion:  ms.SessionVersion,
 				joinedAt:        ms.JoinedAt,
 				lastHeartbeatAt: ms.LastHeartbeatAt,
+				offlineAt:       ms.OfflineAt,
+				retainUntil:     ms.RetainUntil,
 				requests:        make(map[string]requestRecord, len(ms.Requests)),
 			}
 			for _, rs := range ms.Requests {
@@ -219,6 +270,20 @@ func (c *Coordinator) restore(snap *Snapshot) error {
 			}
 			g.members[ms.ID] = m
 		}
+
+		// leader 若非空必须是在线成员（离线保留期内的静态实例不能担任 leader）。
+		if g.leader != "" {
+			lm, ok := g.members[g.leader]
+			if !ok {
+				return errCorrupt("group %q leader %q is not a member", gs.Name, g.leader)
+			}
+			if lm.static && !lm.online {
+				return errCorrupt("group %q leader %q is offline", gs.Name, g.leader)
+			}
+		}
+		// 注：离线静态成员可能在撤销阶段中途断线，因而仍带撤销义务（在途分区
+		// 生效所有权指向它、目标指向别人），这是合法状态——重连后由新会话确认，
+		// 或保留期届满后被整批强制回收。通用在途分区校验（下方）已覆盖该情形。
 
 		// 跨字段一致性：阶段与撤销义务集合、生效/目标所有权必须自洽。
 		if g.phase == PhaseStable {

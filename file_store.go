@@ -33,6 +33,7 @@ type fileGroupSnapshot struct {
 	Name             string             `json:"name"`
 	Partitions       int                `json:"partitions"`
 	SessionTimeout   int64              `json:"session_timeout_ns"`
+	StaticRetention  int64              `json:"static_retention_ns"`
 	Generation       int64              `json:"generation"`
 	Phase            string             `json:"phase"`
 	Leader           string             `json:"leader"`
@@ -55,6 +56,11 @@ type fileMemberSnap struct {
 	JoinedAt        time.Time         `json:"joined_at"`
 	LastHeartbeatAt time.Time         `json:"last_heartbeat_at"`
 	Requests        []fileRequestSnap `json:"requests"`
+	Static          bool              `json:"static"`
+	Online          bool              `json:"online"`
+	SessionVersion  int64             `json:"session_version"`
+	OfflineAt       time.Time         `json:"offline_at"`
+	RetainUntil     time.Time         `json:"retain_until"`
 }
 
 type fileRequestSnap struct {
@@ -79,7 +85,7 @@ type fileOffsetSnap struct {
 	LastRequestID string    `json:"last_request_id"`
 }
 
-const snapshotFormatVersion = 2
+const snapshotFormatVersion = 3
 
 // Save 原子写入整份快照。
 func (s *FileStore) Save(snap Snapshot) error {
@@ -140,14 +146,15 @@ func toFileSnapshot(s *Snapshot) fileSnapshot {
 	out := fileSnapshot{Version: snapshotFormatVersion, Groups: make([]fileGroupSnapshot, 0, len(s.Groups))}
 	for _, g := range s.Groups {
 		fg := fileGroupSnapshot{
-			Name:           g.Name,
-			Partitions:     g.Partitions,
-			SessionTimeout: int64(g.SessionTimeout),
-			Generation:     g.Generation,
-			Phase:          string(g.Phase),
-			Leader:         g.Leader,
-			LastRebalance:  g.LastRebalance,
-			Members:        make([]fileMemberSnap, 0, len(g.Members)),
+			Name:            g.Name,
+			Partitions:      g.Partitions,
+			SessionTimeout:  int64(g.SessionTimeout),
+			StaticRetention: int64(g.StaticRetention),
+			Generation:      g.Generation,
+			Phase:           string(g.Phase),
+			Leader:          g.Leader,
+			LastRebalance:   g.LastRebalance,
+			Members:         make([]fileMemberSnap, 0, len(g.Members)),
 			Assignment: fileAssignmentSnap{
 				Generation: g.Assignment.Generation,
 				CreatedAt:  g.Assignment.CreatedAt,
@@ -167,6 +174,11 @@ func toFileSnapshot(s *Snapshot) fileSnapshot {
 				JoinedAt:        m.JoinedAt,
 				LastHeartbeatAt: m.LastHeartbeatAt,
 				Requests:        make([]fileRequestSnap, 0, len(m.Requests)),
+				Static:          m.Static,
+				Online:          m.Online,
+				SessionVersion:  m.SessionVersion,
+				OfflineAt:       m.OfflineAt,
+				RetainUntil:     m.RetainUntil,
 			}
 			for _, r := range m.Requests {
 				fm.Requests = append(fm.Requests, fileRequestSnap{
@@ -204,14 +216,15 @@ func fromFileSnapshot(fs *fileSnapshot) *Snapshot {
 	snap := &Snapshot{Groups: make([]GroupSnapshot, 0, len(fs.Groups))}
 	for _, fg := range fs.Groups {
 		g := GroupSnapshot{
-			Name:           fg.Name,
-			Partitions:     fg.Partitions,
-			SessionTimeout: time.Duration(fg.SessionTimeout),
-			Generation:     fg.Generation,
-			Phase:          RebalancePhase(fg.Phase),
-			Leader:         fg.Leader,
-			LastRebalance:  fg.LastRebalance,
-			Members:        make([]MemberSnapshot, 0, len(fg.Members)),
+			Name:            fg.Name,
+			Partitions:      fg.Partitions,
+			SessionTimeout:  time.Duration(fg.SessionTimeout),
+			StaticRetention: time.Duration(fg.StaticRetention),
+			Generation:      fg.Generation,
+			Phase:           RebalancePhase(fg.Phase),
+			Leader:          fg.Leader,
+			LastRebalance:   fg.LastRebalance,
+			Members:         make([]MemberSnapshot, 0, len(fg.Members)),
 			Assignment: Assignment{
 				Generation: fg.Assignment.Generation,
 				CreatedAt:  fg.Assignment.CreatedAt,
@@ -231,6 +244,11 @@ func fromFileSnapshot(fs *fileSnapshot) *Snapshot {
 				JoinedAt:        fm.JoinedAt,
 				LastHeartbeatAt: fm.LastHeartbeatAt,
 				Requests:        make([]RequestSnapshot, 0, len(fm.Requests)),
+				Static:          fm.Static,
+				Online:          fm.Online,
+				SessionVersion:  fm.SessionVersion,
+				OfflineAt:       fm.OfflineAt,
+				RetainUntil:     fm.RetainUntil,
 			}
 			for _, fr := range fm.Requests {
 				m.Requests = append(m.Requests, RequestSnapshot{

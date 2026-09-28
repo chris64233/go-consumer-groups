@@ -35,6 +35,14 @@ var (
 	// ErrRevocationMismatch 撤销确认的分区集合与协调器为该成员/版本计算出的
 	// 应撤销集合不精确相等（漏项或携带额外分区）。
 	ErrRevocationMismatch = errors.New("revocation acknowledgement partition set mismatch")
+	// ErrStaleSession 操作来自已被栅栏的旧会话：静态实例已被更高会话版本接管，
+	// 请求携带的会话版本与当前会话不一致，或实例正处于离线保留期（尚无当前会话）。
+	// 旧进程的心跳、撤销确认与位点提交一律返回此错误，不能确认新版本的撤销集合，
+	// 也不能在新会话提交位点后把位点改回旧值。
+	ErrStaleSession = errors.New("stale session: fenced by a newer session version")
+	// ErrStaticIdentityConflict 同一成员 ID 已以另一种身份类型（动态/静态）在组内，
+	// 不能用冲突的身份类型重复加入。
+	ErrStaticIdentityConflict = errors.New("member id already in use with a different membership kind")
 )
 
 // GenerationMismatchError 在操作携带的分配版本与当前版本不一致时返回。
@@ -129,3 +137,29 @@ func (e *RevocationMismatchError) Error() string {
 }
 
 func (e *RevocationMismatchError) Is(target error) bool { return target == ErrRevocationMismatch }
+
+// StaleSessionError 在请求来自已被栅栏的旧会话时返回：
+// 静态实例已被更高会话版本接管，或实例处于离线保留期。
+// errors.Is(err, ErrStaleSession) 成立，字段可区分两种情形。
+type StaleSessionError struct {
+	Group  string
+	Member string
+	// Want 该实例登记的当前会话版本（离线保留期内为最近一次会话版本）。
+	Want int64
+	// Got 请求携带的会话版本。
+	Got int64
+	// Offline 为 true 表示实例当前没有任何活跃会话（处于离线保留期），
+	// 任何旧进程的请求都不应被接受。
+	Offline bool
+}
+
+func (e *StaleSessionError) Error() string {
+	if e.Offline {
+		return fmt.Sprintf("%s: group=%q member=%q is offline within retention (current session=%d, request session=%d)",
+			ErrStaleSession, e.Group, e.Member, e.Want, e.Got)
+	}
+	return fmt.Sprintf("%s: group=%q member=%q current session=%d, request session=%d",
+		ErrStaleSession, e.Group, e.Member, e.Want, e.Got)
+}
+
+func (e *StaleSessionError) Is(target error) bool { return target == ErrStaleSession }
