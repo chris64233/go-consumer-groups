@@ -35,6 +35,10 @@ var (
 	// ErrRevocationMismatch 撤销确认的分区集合与协调器为该成员/版本计算出的
 	// 应撤销集合不精确相等（漏项或携带额外分区）。
 	ErrRevocationMismatch = errors.New("revocation acknowledgement partition set mismatch")
+	// ErrFencedSession 操作来自静态实例的过期会话：该实例已有更高会话版本接管，
+	// 或旧会话在断线后尚未以更高版本重新加入。旧进程的心跳、撤销确认与位点提交
+	// 一律被会话栅栏拒绝。
+	ErrFencedSession = errors.New("static member session fenced: stale or offline")
 )
 
 // GenerationMismatchError 在操作携带的分配版本与当前版本不一致时返回。
@@ -129,3 +133,25 @@ func (e *RevocationMismatchError) Error() string {
 }
 
 func (e *RevocationMismatchError) Is(target error) bool { return target == ErrRevocationMismatch }
+
+// FencedSessionError 在操作来自静态实例的过期会话时返回：
+// 同一实例已有更高会话版本接管（旧进程的迟到操作），或旧会话已断线、
+// 尚未以更高版本重新加入。errors.Is(err, ErrFencedSession) 成立。
+type FencedSessionError struct {
+	Group string
+	// Instance 静态实例标识。
+	Instance string
+	// Member 发起操作的旧会话成员 ID。
+	Member string
+	// Want 该实例当前有效的会话版本；0 表示当前没有任何在线会话。
+	Want int64
+	// Got 请求携带的会话版本。
+	Got int64
+}
+
+func (e *FencedSessionError) Error() string {
+	return fmt.Sprintf("%s: group=%q instance=%q current session version=%d, request session version=%d",
+		ErrFencedSession, e.Group, e.Instance, e.Want, e.Got)
+}
+
+func (e *FencedSessionError) Is(target error) bool { return target == ErrFencedSession }

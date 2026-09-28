@@ -46,6 +46,8 @@ func cloneSnapshot(s *Snapshot) *Snapshot {
 			Leader:           g.Leader,
 			LastRebalance:    g.LastRebalance,
 			Members:          make([]MemberSnapshot, len(g.Members)),
+			StaticInstances:  make([]StaticInstanceSnapshot, len(g.StaticInstances)),
+			DeadSessions:     append([]DeadSessionSnapshot(nil), g.DeadSessions...),
 			Assignment:       g.Assignment.clone(),
 			TargetAssignment: g.TargetAssignment.clone(),
 			Revocations:      make([]RevocationSnapshot, len(g.Revocations)),
@@ -54,11 +56,28 @@ func cloneSnapshot(s *Snapshot) *Snapshot {
 		for j, m := range g.Members {
 			nm := MemberSnapshot{
 				ID:              m.ID,
+				Static:          m.Static,
+				Instance:        m.Instance,
+				SessionVersion:  m.SessionVersion,
 				JoinedAt:        m.JoinedAt,
 				LastHeartbeatAt: m.LastHeartbeatAt,
 				Requests:        append([]RequestSnapshot(nil), m.Requests...),
 			}
 			ng.Members[j] = nm
+		}
+		for j, is := range g.StaticInstances {
+			ng.StaticInstances[j] = StaticInstanceSnapshot{
+				ID:              is.ID,
+				JoinedAt:        is.JoinedAt,
+				Retention:       is.Retention,
+				SessionVersion:  is.SessionVersion,
+				Online:          is.Online,
+				SessionID:       is.SessionID,
+				LastHeartbeatAt: is.LastHeartbeatAt,
+				OfflineAt:       is.OfflineAt,
+				RetainUntil:     is.RetainUntil,
+				Requests:        append([]RequestSnapshot(nil), is.Requests...),
+			}
 		}
 		for j, rv := range g.Revocations {
 			ng.Revocations[j] = RevocationSnapshot{

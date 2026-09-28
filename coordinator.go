@@ -10,25 +10,30 @@ import (
 // DefaultSessionTimeout 是未显式指定时的默认会话超时。
 const DefaultSessionTimeout = 30 * time.Second
 
-// Coordinator 是消费组协调器：管理组成员、分配版本（generation）、
-// 协作式两阶段再均衡与位点提交。
+// Coordinator 是消费组协调器：管理组成员、静态成员身份与会话栅栏、
+// 分配版本（generation）、协作式两阶段再均衡与位点提交。
 //
 // 版本状态机（单调，只会沿一个方向推进）：
 //
-//	stable ──成员加入/离开/超时──▶ revoking ──全部旧所有者确认撤销──▶ stable
-//	           generation +=1        （同一 generation 内收敛）
+//	stable ──成员加入/真正退出/保留期届满──▶ revoking ──全部旧所有者确认撤销──▶ stable
+//	           generation +=1                 （同一 generation 内收敛）
 //
-// 每次成员变化都使 generation +1 并重新计算目标所有权（target）：
+// 每次「真正的」成员变化都使 generation +1 并重新计算目标所有权（target）：
 //   - 新旧版本中所有者不变的分区「未受影响」，始终由原成员继续消费；
 //   - 无主分区立即分派给新所有者；
-//   - 离开/超时成员名下的剩余分区被协调器强制回收，立即移交目标所有者；
-//   - 在两个存活成员之间转移的分区进入「待撤销」：旧所有者确认撤销之前，
+//   - 离开/超时的动态成员、主动退出或保留期届满的静态实例，其名下分区被协调器
+//     强制回收；静态实例的原持有分区作为**一整批**立即移交给唯一后继；
+//   - 在两个在线成员之间转移的分区进入「待撤销」：旧所有者确认撤销之前，
 //     新所有者不能取得该分区（生效所有权仍指向旧所有者）。
+//
+// 静态成员的「暂时离线」**不**推进版本状态机：会话超时后实例在保留期内仍占有
+// 分区，分区既不进入待撤销也不安排新所有者；保留期内以更高会话版本重连则继续
+// 原分配。
 //
 // 并发模型：所有变更操作（心跳、离开、超时扫描、撤销确认、加入、提交）
 // 在同一把互斥锁下串行执行，因此无论以何种顺序并发到达，都只会形成一条
-// 单调的版本状态机序列；携带旧版本的迟到操作在版本校验处即被拒绝，
-// 无法复活成员、无法提前完成再均衡，也无法覆盖新生效的所有权。
+// 单调的版本状态机序列；携带旧版本或旧会话版本的迟到操作在版本/会话校验处
+// 即被拒绝，无法复活成员、无法提前完成再均衡，也无法覆盖新生效的所有权。
 //
 // 状态在每次变更后通过 Store 持久化；进程重启后可从 Store 恢复。
 type Coordinator struct {
@@ -96,6 +101,8 @@ func (c *Coordinator) CreateGroup(opts CreateGroupOptions) error {
 		generation:     0,
 		phase:          PhaseStable,
 		members:        make(map[string]*member),
+		instances:      make(map[string]*staticInstance),
+		deadSessions:   make(map[string]deadSession),
 		assignment:     empty,
 		target:         empty.clone(),
 		offsets:        make(map[int]*Offset),
@@ -103,12 +110,9 @@ func (c *Coordinator) CreateGroup(opts CreateGroupOptions) error {
 	return c.persistLocked()
 }
 
-// Join 将成员加入组，触发一次协作式再均衡：分配版本 +1，重新计算目标所有权。
-//
-// 未受影响分区继续由原成员消费；从存活成员转移给其他存活成员的分区进入
-// 待撤销状态，返回值的 Assignment（生效所有权）里新成员尚未取得它们，
-// TargetAssignment 才是最终目标；无主分区则立即归新成员生效持有。
-// 重复加入同一成员 ID 返回 ErrMemberAlreadyExists。
+// Join 将一个普通（动态）成员加入组，触发一次协作式再均衡：分配版本 +1。
+// 重复加入同一成员 ID、或该 ID 已被某静态实例（含保留期内离线者）占用时
+// 返回 ErrMemberAlreadyExists。
 func (c *Coordinator) Join(groupName, memberID string) (JoinResult, error) {
 	if memberID == "" {
 		return JoinResult{}, fmt.Errorf("%w: member id is required", ErrInvalidArgument)
@@ -123,6 +127,10 @@ func (c *Coordinator) Join(groupName, memberID string) (JoinResult, error) {
 	if _, ok := g.members[memberID]; ok {
 		return JoinResult{}, fmt.Errorf("%w: group=%q member=%q", ErrMemberAlreadyExists, groupName, memberID)
 	}
+	// 所有权字符串命名空间里动态成员 ID 与静态实例 ID 不得重名。
+	if _, ok := g.instances[memberID]; ok {
+		return JoinResult{}, fmt.Errorf("%w: group=%q id=%q is a static instance", ErrMemberAlreadyExists, groupName, memberID)
+	}
 
 	now := c.clock.Now()
 	g.members[memberID] = &member{
@@ -131,24 +139,135 @@ func (c *Coordinator) Join(groupName, memberID string) (JoinResult, error) {
 		lastHeartbeatAt: now,
 		requests:        make(map[string]requestRecord),
 	}
-	if g.leader == "" {
-		g.leader = memberID
-	}
-	c.rebalanceLocked(g, now)
+	c.rebalanceLocked(g, now, nil)
 	if err := c.persistLocked(); err != nil {
 		return JoinResult{}, err
 	}
 	return g.joinResultLocked(memberID), nil
 }
 
-// Heartbeat 上报成员心跳。只有携带当前分配版本的心跳才被接受；
-// 携带旧版本（或超前版本）的心跳返回 ErrIllegalGeneration，
-// 成员已被剔除时返回 ErrMemberNotFound。被接受的心跳会刷新会话截止时间。
+// JoinStatic 让一个静态成员以稳定实例标识加入组。
 //
-// 撤销阶段心跳同样被接受（成员一边继续消费未受影响分区、一边等待撤销确认），
-// 返回值携带生效所有权、目标所有权与该成员尚待撤销的分区列表。
-// 心跳本身不推进版本状态机。
+//   - 实例首次加入：分配会话版本 1，像普通加入一样触发一次协作式再均衡，
+//     返回 Rejoined=false；
+//   - 实例保留期内断线后重连（或同一实例的新进程接管在线会话）：会话版本 +1，
+//     旧会话立即被栅栏，**不触发再均衡**，实例继续原分配，返回 Rejoined=true；
+//   - 超过保留期（实例已被清退）后重连等价于首次加入，会话版本重新从 1 开始。
+//
+// 同一实例的两个进程并发加入时，只允许会话版本更高（后到）的会话成为当前会话。
+func (c *Coordinator) JoinStatic(groupName string, opts StaticJoinOptions) (StaticJoinResult, error) {
+	if opts.InstanceID == "" {
+		return StaticJoinResult{}, fmt.Errorf("%w: static instance id is required", ErrInvalidArgument)
+	}
+	if opts.SessionID == "" {
+		return StaticJoinResult{}, fmt.Errorf("%w: static session id is required", ErrInvalidArgument)
+	}
+	if opts.Retention <= 0 {
+		return StaticJoinResult{}, fmt.Errorf("%w: static retention must be positive, got %s", ErrInvalidArgument, opts.Retention)
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	g, err := c.groupLocked(groupName)
+	if err != nil {
+		return StaticJoinResult{}, err
+	}
+	// 所有权字符串命名空间：动态成员 ID、静态实例 ID、活动会话 ID 两两不得重名。
+	// 唯一例外是实例以自己的实例 ID 作为会话 ID（S == I）或带着当前会话重入。
+	if m, ok := g.members[opts.InstanceID]; ok && (!m.static || m.instance != opts.InstanceID) {
+		return StaticJoinResult{}, fmt.Errorf("%w: group=%q id=%q already in use", ErrMemberAlreadyExists, groupName, opts.InstanceID)
+	}
+	if opts.SessionID != opts.InstanceID {
+		if m, ok := g.members[opts.SessionID]; ok && (!m.static || m.instance != opts.InstanceID) {
+			return StaticJoinResult{}, fmt.Errorf("%w: group=%q session=%q", ErrMemberAlreadyExists, groupName, opts.SessionID)
+		}
+		if _, isInstance := g.instances[opts.SessionID]; isInstance {
+			return StaticJoinResult{}, fmt.Errorf("%w: group=%q session=%q is another static instance id",
+				ErrMemberAlreadyExists, groupName, opts.SessionID)
+		}
+	}
+
+	now := c.clock.Now()
+	inst, exists := g.instances[opts.InstanceID]
+	fresh := !exists
+	var expiryBatches map[string][]int
+
+	// 保留期已过但扫描尚未发生：按真正退出处理——旧分区作为整批在本次再均衡
+	// 中移交唯一后继，实例身份重新从会话版本 1 开始。
+	if exists && !inst.online && now.After(inst.retainUntil) {
+		expiryBatches = c.evictInstanceLocked(g, inst)
+		fresh = true
+	}
+
+	if fresh {
+		inst = &staticInstance{
+			id:        opts.InstanceID,
+			joinedAt:  now,
+			retention: opts.Retention,
+			version:   1,
+			online:    true,
+			sessionID: opts.SessionID,
+			requests:  make(map[string]requestRecord),
+		}
+		inst.lastHeartbeatAt = now
+		g.instances[inst.id] = inst
+		g.members[opts.SessionID] = newSessionMember(inst, now)
+		c.rebalanceLocked(g, now, expiryBatches)
+		if err := c.persistLocked(); err != nil {
+			return StaticJoinResult{}, err
+		}
+		return g.staticJoinResultLocked(inst, false), nil
+	}
+
+	// 已存在实例：重连或并发接管。
+	if inst.online && inst.sessionID == opts.SessionID {
+		// 同会话幂等重入（加入响应丢失后的重试）：不提升版本、不改变任何状态。
+		return g.staticJoinResultLocked(inst, true), nil
+	}
+	rejoined := true
+	if inst.online {
+		// 并发接管：旧会话退场为死会话并被栅栏。
+		g.supersedeSessionLocked(inst, now)
+	} else {
+		// 保留期内重连：实例回到在线。离线时旧会话已入坟场用于栅栏断线后的
+		// 迟到操作；若新进程沿用同一会话 ID，则把它从坟场移除（会话重新激活，
+		// 旧进程的在途请求仍会因会话版本递增被栅栏）；换用新会话 ID 时旧记录
+		// 保留，继续拒绝旧进程。
+		oldSession := inst.sessionID
+		if oldSession != "" && oldSession == opts.SessionID {
+			delete(g.deadSessions, oldSession)
+		}
+		inst.online = true
+		inst.offlineAt = time.Time{}
+		inst.retainUntil = time.Time{}
+	}
+	if opts.Retention > 0 {
+		inst.retention = opts.Retention
+	}
+	inst.version++
+	inst.sessionID = opts.SessionID
+	inst.lastHeartbeatAt = now
+	g.members[opts.SessionID] = newSessionMember(inst, now)
+	g.leader = pickLeaderPrincipals(g.principalsLocked())
+	if err := c.persistLocked(); err != nil {
+		return StaticJoinResult{}, err
+	}
+	return g.staticJoinResultLocked(inst, rejoined), nil
+}
+
+// Heartbeat 上报成员心跳。动态成员传 memberID + generation（SessionVersion=0）；
+// 静态成员传当前会话 ID + generation + 加入时获得的会话版本。
+//
+// 只有携带当前分配版本、且（静态成员）当前会话版本的心跳才被接受：
+// 旧版本返回 ErrIllegalGeneration；被接管的旧进程、断线后未重连的旧会话返回
+// ErrFencedSession；成员/会话不存在返回 ErrMemberNotFound。
+// 心跳本身不推进版本状态机，但会刷新会话截止时间。
 func (c *Coordinator) Heartbeat(groupName, memberID string, generation int64) (HeartbeatResult, error) {
+	return c.HeartbeatV2(groupName, HeartbeatRequest{MemberID: memberID, Generation: generation})
+}
+
+// HeartbeatV2 是支持静态会话版本的心跳入口，语义见 Heartbeat。
+func (c *Coordinator) HeartbeatV2(groupName string, req HeartbeatRequest) (HeartbeatResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -156,24 +275,27 @@ func (c *Coordinator) Heartbeat(groupName, memberID string, generation int64) (H
 	if err != nil {
 		return HeartbeatResult{}, err
 	}
-	// 先校验版本：迟到的心跳即使指向仍存在的成员也不得生效。
-	if err := g.checkGeneration(generation); err != nil {
+	// 先校验分配版本：迟到的心跳即使指向仍存在的会话也不得生效。
+	if err := g.checkGeneration(req.Generation); err != nil {
 		return HeartbeatResult{}, err
 	}
-	m, ok := g.members[memberID]
-	if !ok {
-		return HeartbeatResult{}, fmt.Errorf("%w: group=%q member=%q", ErrMemberNotFound, groupName, memberID)
+	principalID, _, err := g.resolveSessionLocked(req.MemberID, req.SessionVersion)
+	if err != nil {
+		return HeartbeatResult{}, err
 	}
-	m.lastHeartbeatAt = c.clock.Now()
+	g.members[req.MemberID].lastHeartbeatAt = c.clock.Now()
+	if inst := g.instances[principalID]; inst != nil {
+		inst.lastHeartbeatAt = g.members[req.MemberID].lastHeartbeatAt
+	}
 	if err := c.persistLocked(); err != nil {
 		return HeartbeatResult{}, err
 	}
-	return g.heartbeatResultLocked(memberID), nil
+	return g.heartbeatResultLocked(principalID), nil
 }
 
-// Leave 让成员主动离开组，触发再均衡（分配版本 +1）。
-// 离开成员名下的剩余分区（含其尚待撤销的分区）被协调器强制回收并立即
-// 移交目标所有者，不需要它的撤销确认。成员不存在时返回 ErrMemberNotFound。
+// Leave 让动态成员主动离开组，触发再均衡（分配版本 +1）。其名下剩余分区
+// （含尚待撤销的分区）被强制回收并立即移交目标所有者。
+// 静态实例请使用 LeaveStatic：对静态会话 ID 调用本方法返回 ErrInvalidArgument。
 func (c *Coordinator) Leave(groupName, memberID string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -182,17 +304,54 @@ func (c *Coordinator) Leave(groupName, memberID string) error {
 	if err != nil {
 		return err
 	}
-	if _, ok := g.members[memberID]; !ok {
+	m, ok := g.members[memberID]
+	if !ok {
 		return fmt.Errorf("%w: group=%q member=%q", ErrMemberNotFound, groupName, memberID)
 	}
-	c.removeMemberLocked(g, memberID)
-	c.rebalanceLocked(g, c.clock.Now())
+	if m.static {
+		return fmt.Errorf("%w: group=%q session=%q belongs to static instance %q, use LeaveStatic",
+			ErrInvalidArgument, groupName, memberID, m.instance)
+	}
+	delete(g.members, memberID)
+	c.rebalanceLocked(g, c.clock.Now(), nil)
 	return c.persistLocked()
 }
 
-// ExpireGroup 扫描单个组，剔除会话超时（now - lastHeartbeat > 会话超时）的
-// 成员。只要有成员被剔除就触发一次再均衡；返回被剔除的成员 ID（升序）。
-// 超时成员的剩余分区被强制回收。没有成员超时时不推进版本，返回空切片。
+// LeaveStatic 让静态实例主动退出组（无论当前在线还是保留期内暂时离线）。
+// 实例立即真正退出：其名下分区作为一整批强制回收、在本次再均衡中整体移交给
+// 唯一后继；会话版本与保留身份一并清除，旧会话之后的一切操作都按未知成员拒绝。
+func (c *Coordinator) LeaveStatic(groupName, instanceID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	g, err := c.groupLocked(groupName)
+	if err != nil {
+		return err
+	}
+	inst, ok := g.instances[instanceID]
+	if !ok {
+		return fmt.Errorf("%w: group=%q static instance=%q", ErrMemberNotFound, groupName, instanceID)
+	}
+	batches := c.evictInstanceLocked(g, inst)
+	c.rebalanceLocked(g, c.clock.Now(), batches)
+	return c.persistLocked()
+}
+
+// RemoveInstance 供管理员移除静态实例（在线或保留期内离线均可）。
+// 清退规则与 LeaveStatic 完全相同：分区整批移交唯一后继，立即触发协作式再均衡。
+func (c *Coordinator) RemoveInstance(groupName, instanceID string) error {
+	return c.LeaveStatic(groupName, instanceID)
+}
+
+// ExpireGroup 扫描单个组：
+//   - 动态成员超过 SessionTimeout 未心跳：彻底剔除并强制回收分区；
+//   - 静态会话超过 SessionTimeout 未心跳：实例转为「暂时离线」，保留期内继续
+//     占有分区（不推进版本、不转移）；
+//   - 离线静态实例超过保留期仍未以更高会话版本重连：真正清退，原持有分区整批
+//     移交唯一后继，纳入本次协作式再均衡。
+//
+// 返回真正退出（动态超时 + 静态保留期届满）的成员/实例 ID（升序）；
+// 仅转为暂时离线的静态会话不计入返回值，但状态同样会持久化。
 func (c *Coordinator) ExpireGroup(groupName string, now time.Time) ([]string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -201,15 +360,18 @@ func (c *Coordinator) ExpireGroup(groupName string, now time.Time) ([]string, er
 	if err != nil {
 		return nil, err
 	}
-	expired := c.expireLocked(g, now)
-	if len(expired) == 0 {
+	removed, offlined, batches := c.expireLocked(g, now)
+	if len(removed) == 0 && !offlined {
 		return nil, nil
 	}
-	return expired, c.persistLocked()
+	if len(removed) > 0 {
+		c.rebalanceLocked(g, now, batches)
+	}
+	return removed, c.persistLocked()
 }
 
 // ExpireAll 对所有组执行一次超时扫描（组名升序处理，保证行为确定）。
-// 返回发生再均衡的组名。典型用法是由后台定时器周期调用。
+// 返回发生真正成员退出或保留期届满清退的组名。典型用法是由后台定时器周期调用。
 func (c *Coordinator) ExpireAll(now time.Time) ([]string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -221,30 +383,31 @@ func (c *Coordinator) ExpireAll(now time.Time) ([]string, error) {
 	sort.Strings(names)
 
 	var changed []string
+	dirty := false
 	for _, name := range names {
-		if expired := c.expireLocked(c.groups[name], now); len(expired) > 0 {
+		g := c.groups[name]
+		removed, offlined, batches := c.expireLocked(g, now)
+		if len(removed) > 0 {
+			c.rebalanceLocked(g, now, batches)
 			changed = append(changed, name)
+			dirty = true
+		} else if offlined {
+			// 仅静态离线转换：不推进版本、不计入返回值，但状态需要落盘。
+			dirty = true
 		}
 	}
-	if len(changed) == 0 {
+	if !dirty {
 		return nil, nil
 	}
 	return changed, c.persistLocked()
 }
 
 // AckRevocation 确认成员已在指定分配版本下停止消费给定分区集合、可以移交。
+// 静态成员须携带当前会话 ID 与会话版本；旧会话的确认返回 ErrFencedSession。
 //
-// 校验顺序：组存在 -> 分配版本严格匹配当前版本（旧版本/超前版本一律拒绝）->
-// 成员在组 -> 成员在本版本确有撤销义务 -> 分区全部合法 ->
-// 确认集合与应撤销集合精确相等。
-//
-// 漏项（少交）、额外分区（多交，含替别人确认）返回 ErrRevocationMismatch，
-// 且不转移任何分区；旧版本确认返回 ErrIllegalGeneration，不能提前完成再均衡；
-// 稳定阶段或无撤销义务的确认返回 ErrNoRevocationInProgress。
-//
-// 确认可安全重试：同一版本内重复确认（无论再均衡是否已随本次确认收敛）
-// 都按幂等成功返回，不会重复转移或报错。确认一旦受理，对应分区的生效所有权
-// 立即从旧所有者切到目标所有者；全体义务成员确认完毕后版本收敛为 stable。
+// 其余校验与语义同协作式再均衡：分配版本严格匹配；确认集合与应撤销集合精确
+// 相等（漏项/多项返回 ErrRevocationMismatch 且本次不转移任何分区）；
+// 同版本内重复确认幂等成功；全体义务成员确认完毕后版本在同一 generation 内收敛。
 func (c *Coordinator) AckRevocation(groupName string, req RevocationAckRequest) (RevocationAckResult, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -256,8 +419,11 @@ func (c *Coordinator) AckRevocation(groupName string, req RevocationAckRequest) 
 	if err := g.checkGeneration(req.Generation); err != nil {
 		return RevocationAckResult{}, err
 	}
-	if _, ok := g.members[req.MemberID]; !ok {
-		return RevocationAckResult{}, fmt.Errorf("%w: group=%q member=%q", ErrMemberNotFound, groupName, req.MemberID)
+	// 会话栅栏先于 stable 幂等捷径：旧会话绝不能确认（哪怕是重复确认）新版本
+	// 的撤销集合。
+	principalID, _, err := g.resolveSessionLocked(req.MemberID, req.SessionVersion)
+	if err != nil {
+		return RevocationAckResult{}, err
 	}
 
 	// 稳定阶段的同版本确认视为已完成确认的幂等重放（响应可能在网络中丢失）。
@@ -269,9 +435,8 @@ func (c *Coordinator) AckRevocation(groupName string, req RevocationAckRequest) 
 		}, nil
 	}
 
-	required, hasObligation := g.revokeRequired[req.MemberID]
+	required, hasObligation := g.revokeRequired[principalID]
 	if !hasObligation || len(required) == 0 {
-		// 与本成员无关的确认绝不能推动状态机、更不能提前完成整个再均衡。
 		return RevocationAckResult{}, fmt.Errorf(
 			"%w: group=%q member=%q generation=%d has no revocation obligation",
 			ErrNoRevocationInProgress, groupName, req.MemberID, g.generation)
@@ -286,7 +451,6 @@ func (c *Coordinator) AckRevocation(groupName string, req RevocationAckRequest) 
 		got[p] = struct{}{}
 	}
 
-	// 集合必须精确相等：漏项 / 额外分区都明确拒绝，且本次不转移任何分区。
 	var missing, extra []int
 	for p := range required {
 		if _, ok := got[p]; !ok {
@@ -303,7 +467,7 @@ func (c *Coordinator) AckRevocation(groupName string, req RevocationAckRequest) 
 		sort.Ints(extra)
 		return RevocationAckResult{}, &RevocationMismatchError{
 			Group:    groupName,
-			Member:   req.MemberID,
+			Member:   principalID,
 			WantGen:  g.generation,
 			Expected: sortedSet(required),
 			Got:      sortedSet(got),
@@ -312,8 +476,8 @@ func (c *Coordinator) AckRevocation(groupName string, req RevocationAckRequest) 
 		}
 	}
 
-	// 幂等重试：该成员已确认过（其他人尚未确认，版本仍在撤销阶段）。
-	already := g.revokeAcked[req.MemberID]
+	// 幂等重试：该主体已确认过（其他人尚未确认，版本仍在撤销阶段）。
+	already := g.revokeAcked[principalID]
 	if already != nil && len(already) == len(required) {
 		return RevocationAckResult{
 			Generation:          g.generation,
@@ -323,15 +487,13 @@ func (c *Coordinator) AckRevocation(groupName string, req RevocationAckRequest) 
 		}, nil
 	}
 
-	// 受理确认：分区生效所有权逐个移交目标所有者。
 	acked := make(map[int]struct{}, len(required))
 	for p := range required {
 		g.assignment.Owners[p] = g.target.Owners[p]
 		acked[p] = struct{}{}
 	}
-	g.revokeAcked[req.MemberID] = acked
+	g.revokeAcked[principalID] = acked
 
-	// 全体义务成员确认完毕 => 版本在同一 generation 内收敛。
 	completed := true
 	for member, required := range g.revokeRequired {
 		if len(g.revokeAcked[member]) != len(required) {
@@ -355,19 +517,13 @@ func (c *Coordinator) AckRevocation(groupName string, req RevocationAckRequest) 
 
 // CommitOffset 提交分区位点。
 //
-// 校验顺序：组存在 -> 分配版本匹配 -> 成员在组 -> 分区合法 ->
-// 成员是当前生效所有者 -> 幂等请求号 -> 位点单调性。
+// 静态成员以当前会话 ID + 会话版本提交，分区生效所有者按其实例标识判定；
+// 被更高会话版本接管的旧进程在会话栅栏处直接返回 ErrFencedSession，且静态
+// 成员的幂等请求记录归属于实例本身（跨重连仍生效），因此新会话的提交与旧会话
+// 的最终提交在同一条单调序列上比较，位点不可能倒退。
 //
-// 所有权栅栏：提交只认「生效所有权」。待撤销分区在旧所有者确认撤销前仍归
-// 其有效持有，因此它可以提交最终位点；一旦确认受理、分区转移完成，旧成员
-// 的迟到提交（即使携带当前版本）立即返回 ErrNotOwner，无法在新所有者接手后
-// 覆盖位点。
-//
-// 幂等性：同一成员对同一请求号的重放（分区与位点完全一致）直接成功且
-// 不重复推进；同请求号携带不同分区或位点返回 ErrRequestConflict。
-// 单调性：默认位点不得后退，后退返回 ErrOffsetBacktrack；
-// 并发提交在锁内串行执行，较大位点先落地时，较小的迟到提交被拒绝，
-// 因此不会丢掉较大的合法值。
+// 其余语义不变：只认生效所有权（ErrNotOwner）；请求号幂等（重放/冲突）；
+// 默认位点单调（ErrOffsetBacktrack）。
 func (c *Coordinator) CommitOffset(groupName string, req CommitRequest) (CommitResult, error) {
 	if req.RequestID == "" {
 		return CommitResult{}, fmt.Errorf("%w: request id is required for idempotent commit", ErrInvalidArgument)
@@ -382,31 +538,34 @@ func (c *Coordinator) CommitOffset(groupName string, req CommitRequest) (CommitR
 	if err := g.checkGeneration(req.Generation); err != nil {
 		return CommitResult{}, err
 	}
-	m, ok := g.members[req.MemberID]
-	if !ok {
-		return CommitResult{}, fmt.Errorf("%w: group=%q member=%q", ErrMemberNotFound, groupName, req.MemberID)
+	principalID, inst, err := g.resolveSessionLocked(req.MemberID, req.SessionVersion)
+	if err != nil {
+		return CommitResult{}, err
 	}
 	if req.Partition < 0 || req.Partition >= g.partitions {
 		return CommitResult{}, fmt.Errorf("%w: group=%q partition=%d (partitions=%d)",
 			ErrInvalidPartition, groupName, req.Partition, g.partitions)
 	}
-	// 生效所有权栅栏：待撤销期间旧主可提交最终位点；转移完成后旧主被拒。
-	if owner := g.assignment.OwnerOf(req.Partition); owner != req.MemberID {
+	// 生效所有权栅栏：静态实例按实例标识判定，待撤销期间旧主可提交最终位点。
+	if owner := g.assignment.OwnerOf(req.Partition); owner != principalID {
 		return CommitResult{}, &NotPartitionOwnerError{
-			Group: groupName, Partition: req.Partition, Owner: owner, Member: req.MemberID,
+			Group: groupName, Partition: req.Partition, Owner: owner, Member: principalID,
 		}
 	}
 
-	// 幂等请求号：命中记录时按内容一致性判定重放或冲突。
-	if rec, seen := m.requests[req.RequestID]; seen {
+	// 幂等请求号归属于「所有权主体」：动态成员为其在组生命周期，静态实例跨重连。
+	requests := g.members[req.MemberID].requests
+	if inst != nil {
+		requests = inst.requests
+	}
+	if rec, seen := requests[req.RequestID]; seen {
 		if rec.partition != req.Partition || rec.offset != req.Offset {
 			return CommitResult{}, &RequestConflictError{
-				Group: groupName, Member: req.MemberID, RequestID: req.RequestID,
+				Group: groupName, Member: principalID, RequestID: req.RequestID,
 				ExistingPartition: rec.partition, ExistingOffset: rec.offset,
 				GotPartition: req.Partition, GotOffset: req.Offset,
 			}
 		}
-		// 重放：不重复推进位点，返回当前生效值。
 		return CommitResult{Offset: g.offsets[req.Partition].Offset, Replayed: true}, nil
 	}
 
@@ -425,7 +584,7 @@ func (c *Coordinator) CommitOffset(groupName string, req CommitRequest) (CommitR
 	cur.Metadata = req.Metadata
 	cur.CommittedAt = now
 	cur.LastRequestID = req.RequestID
-	m.requests[req.RequestID] = requestRecord{
+	requests[req.RequestID] = requestRecord{
 		partition: req.Partition, offset: req.Offset, metadata: req.Metadata, committedAt: now,
 	}
 	if err := c.persistLocked(); err != nil {
@@ -434,8 +593,8 @@ func (c *Coordinator) CommitOffset(groupName string, req CommitRequest) (CommitR
 	return CommitResult{Offset: cur.Offset}, nil
 }
 
-// Status 返回组的完整状态快照（深拷贝，调用方可安全持有）：当前生效所有权、
-// 目标所有权、待撤销集合、各成员确认进度、成员、位点等全部协调状态。
+// Status 返回组的完整状态快照（深拷贝）：动态成员、静态实例（含保留期内离线者）、
+// 生效/目标所有权、待撤销集合、待转移分区、确认进度、位点等全部协调状态。
 func (c *Coordinator) Status(groupName string) (GroupStatus, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -461,6 +620,7 @@ func (c *Coordinator) Groups() []string {
 
 // ---- 内部实现（调用方须已持有 c.mu）----
 
+// group 是单个组的全部运行时状态。
 type group struct {
 	name           string
 	partitions     int
@@ -468,15 +628,23 @@ type group struct {
 	generation     int64
 	phase          RebalancePhase
 	leader         string
-	members        map[string]*member
-	// assignment 当前生效所有权：未受影响分区与已移交完成的分区指向当前可消费方，
-	// 待撤销分区仍指向旧所有者。其 Generation 始终等于组当前 generation。
+	// members 当前活动会话：动态成员（static=false，key==成员 ID）与在线静态
+	// 实例的当前会话（static=true，key==会话 ID）。静态实例断线后其会话从此移除。
+	members map[string]*member
+	// instances 全部静态实例（含保留期内暂时离线者），key 为稳定实例标识；
+	// 分区所有权字符串对静态成员使用该标识。
+	instances map[string]*staticInstance
+	// deadSessions 已退场会话 ID -> 其所属实例与退场时版本，用于把旧进程的
+	// 迟到操作稳定地拒绝为 ErrFencedSession（实例被清退后记录随之删除）。
+	deadSessions map[string]deadSession
+	// assignment 当前生效所有权，其 Generation 始终等于组当前 generation。
 	assignment Assignment
 	// target 本版本的目标所有权，发布后不可变；stable 时与 assignment 一致。
 	target Assignment
-	// revokeRequired 成员 -> 本版本它必须撤销的分区集合（两存活成员间转移的分区）。
+	// revokeRequired 所有权主体 ID（动态成员 ID 或静态实例 ID）-> 本版本它必须
+	// 撤销的分区集合（两个在线主体间转移的分区）。
 	revokeRequired map[string]map[int]struct{}
-	// revokeAcked 成员 -> 已确认撤销的分区集合（revokeRequired 的子集）。
+	// revokeAcked 主体 ID -> 已确认撤销的分区集合（revokeRequired 的子集）。
 	revokeAcked   map[string]map[int]struct{}
 	offsets       map[int]*Offset
 	lastRebalance time.Time
@@ -484,11 +652,36 @@ type group struct {
 
 type member struct {
 	id              string
+	static          bool
+	instance        string // static=true 时指向 instances 中的实例标识
+	sessionVersion  int64  // 静态会话版本；动态成员为 0
 	joinedAt        time.Time
 	lastHeartbeatAt time.Time
-	// requests 记录该成员已受理的幂等请求号及其提交内容，
-	// 成员被剔除后随之清除（请求号作用域为成员的一次在组生命周期）。
+	// requests 仅动态成员使用；静态成员的幂等记录归属于 staticInstance。
 	requests map[string]requestRecord
+}
+
+// staticInstance 是一个静态成员的持久身份，跨多次会话/重连存活。
+type staticInstance struct {
+	id        string
+	joinedAt  time.Time
+	retention time.Duration
+	// version 单调会话版本：每次成功加入（重连/接管）+1。
+	version int64
+	online  bool
+	// sessionID 当前在线会话 ID；离线时保留最后会话 ID 用于展示。
+	sessionID       string
+	lastHeartbeatAt time.Time
+	offlineAt       time.Time
+	// retainUntil 离线保留期限；在线时为零值。
+	retainUntil time.Time
+	// requests 幂等请求记录，作用域为实例本身，跨重连持续生效。
+	requests map[string]requestRecord
+}
+
+type deadSession struct {
+	instance string
+	version  int64
 }
 
 type requestRecord struct {
@@ -496,6 +689,17 @@ type requestRecord struct {
 	offset      int64
 	metadata    string
 	committedAt time.Time
+}
+
+func newSessionMember(inst *staticInstance, now time.Time) *member {
+	return &member{
+		id:              inst.sessionID,
+		static:          true,
+		instance:        inst.id,
+		sessionVersion:  inst.version,
+		joinedAt:        inst.joinedAt,
+		lastHeartbeatAt: now,
+	}
 }
 
 func (c *Coordinator) groupLocked(name string) (*group, error) {
@@ -513,16 +717,88 @@ func (g *group) checkGeneration(generation int64) error {
 	return nil
 }
 
-// rebalanceLocked 推进一个分配版本：基于变更后的成员集合重新计算目标所有权，
-// 并据此得到新的生效所有权与每成员撤销义务。
-func (c *Coordinator) rebalanceLocked(g *group, now time.Time) {
+// resolveSessionLocked 把请求中的 (会话ID, 会话版本) 解析为所有权主体 ID，
+// 并对静态会话做版本栅栏。动态成员返回其成员 ID、inst=nil。
+func (g *group) resolveSessionLocked(sessionID string, version int64) (string, *staticInstance, error) {
+	m, ok := g.members[sessionID]
+	if ok {
+		if !m.static {
+			return m.id, nil, nil
+		}
+		inst := g.instances[m.instance]
+		if version != inst.version {
+			return "", nil, g.fenceError(inst, sessionID, version)
+		}
+		return inst.id, inst, nil
+	}
+	if dead, ok := g.deadSessions[sessionID]; ok {
+		var inst *staticInstance
+		if live, exists := g.instances[dead.instance]; exists {
+			inst = live
+		}
+		return "", nil, g.fenceError(inst, sessionID, version)
+	}
+	return "", nil, fmt.Errorf("%w: group=%q member=%q", ErrMemberNotFound, g.name, sessionID)
+}
+
+func (g *group) fenceError(inst *staticInstance, sessionID string, got int64) error {
+	var instance string
+	var want int64
+	if inst != nil {
+		instance = inst.id
+		if inst.online {
+			want = inst.version
+		}
+	} else if id, ok := g.deadSessions[sessionID]; ok {
+		instance = id.instance
+	}
+	return &FencedSessionError{Group: g.name, Instance: instance, Member: sessionID, Want: want, Got: got}
+}
+
+// principalsLocked 列出参与分配的全部主体：动态成员与静态实例（含离线者）。
+func (g *group) principalsLocked() []principal {
+	out := make([]principal, 0, len(g.members)+len(g.instances))
+	for id, m := range g.members {
+		if !m.static {
+			out = append(out, principal{id: id, joinedAt: m.joinedAt, online: true})
+		}
+	}
+	for id, inst := range g.instances {
+		out = append(out, principal{
+			id: id, joinedAt: inst.joinedAt, online: inst.online, static: true,
+		})
+	}
+	return out
+}
+
+// rebalanceLocked 推进一个分配版本：基于变更后的主体集合重新计算目标所有权，
+// 并据此得到新的生效所有权与每主体撤销义务。
+// evictedBatches 给出本次被真正清退的静态实例原持有分区批次（整批 -> 唯一后继）。
+func (c *Coordinator) rebalanceLocked(g *group, now time.Time, evictedBatches map[string][]int) {
 	g.generation++
-	target := planAssignment(g.generation, g.partitions, g.members, now)
+
+	principals := g.principalsLocked()
+	g.leader = pickLeaderPrincipals(principals)
+
+	// 保留期内离线实例仍生效持有的分区在本版本钉住（不参与再分配）。
+	retained := make(map[int]string)
+	offline := make(map[string]bool)
+	for _, p := range principals {
+		if p.static && !p.online {
+			offline[p.id] = true
+		}
+	}
+	for p := 0; p < g.partitions; p++ {
+		owner := g.assignment.OwnerOf(p)
+		if owner != "" && offline[owner] {
+			retained[p] = owner
+		}
+	}
+
+	target := planTarget(g.generation, g.partitions, principals, retained, evictedBatches, now)
 	g.target = target
-	g.leader = pickLeader(g.members)
 	g.lastRebalance = now
 
-	// 新版本一律作废旧版本的全部撤销确认，按新生效/目标差异重新计算。
 	required := make(map[string]map[int]struct{})
 	effective := make([]string, g.partitions)
 	for p := 0; p < g.partitions; p++ {
@@ -530,18 +806,17 @@ func (c *Coordinator) rebalanceLocked(g *group, now time.Time) {
 		new := target.OwnerOf(p)
 		switch {
 		case old == new:
-			// 未受影响：原成员继续消费（也覆盖双方都为空串的情形）。
 			effective[p] = old
 		case old == "":
 			// 无主分区：新所有者立即生效取得。
 			effective[p] = new
 		default:
-			if _, alive := g.members[old]; !alive {
-				// 旧所有者已离开/超时：强制回收其剩余分区，立即移交目标所有者，
-				// 不等待任何确认（new 为空串时分区回到无主）。
+			if _, online := g.onlinePrincipalLocked(old); !online {
+				// 旧主体已离开/超时/被清退，或本就保留期内离线（其分区已钉住，
+				// 不会走到这里）：强制回收并立即移交目标所有者。
 				effective[p] = new
 			} else {
-				// 两个存活成员之间的转移：旧主确认撤销前继续有效持有。
+				// 两个在线主体之间的转移：旧主确认撤销前继续有效持有。
 				effective[p] = old
 				set := required[old]
 				if set == nil {
@@ -557,11 +832,41 @@ func (c *Coordinator) rebalanceLocked(g *group, now time.Time) {
 	g.revokeRequired = required
 	g.revokeAcked = make(map[string]map[int]struct{})
 	if len(required) == 0 {
-		// 没有需要存活成员交出的分区：版本在本代内立即收敛。
 		c.completeRevocationLocked(g)
 	} else {
 		g.phase = PhaseRevoking
 	}
+}
+
+// onlinePrincipalLocked 返回主体是否为当前在线主体（动态成员恒在线）。
+func (g *group) onlinePrincipalLocked(id string) (*principal, bool) {
+	if m, ok := g.members[id]; ok {
+		if m.static {
+			inst := g.instances[m.instance]
+			return &principal{id: inst.id, online: true, static: true}, true
+		}
+		return &principal{id: id, online: true}, true
+	}
+	if inst, ok := g.instances[id]; ok {
+		return &principal{id: id, online: inst.online, static: true}, inst.online
+	}
+	return nil, false
+}
+
+// principalLocked 判断 id 是否为现存所有权主体（动态成员或静态实例），
+// 不要求当前在线——保留期内离线的静态实例仍是主体。
+func (g *group) principalLocked(id string) (*principal, bool) {
+	if m, ok := g.members[id]; ok {
+		if m.static {
+			inst := g.instances[m.instance]
+			return &principal{id: inst.id, online: true, static: true}, true
+		}
+		return &principal{id: id, online: true}, true
+	}
+	if inst, ok := g.instances[id]; ok {
+		return &principal{id: id, online: inst.online, static: true}, true
+	}
+	return nil, false
 }
 
 // completeRevocationLocked 令生效所有权追上目标所有权，版本收敛为 stable。
@@ -572,36 +877,108 @@ func (c *Coordinator) completeRevocationLocked(g *group) {
 	g.revokeAcked = nil
 }
 
-func (c *Coordinator) removeMemberLocked(g *group, memberID string) {
-	delete(g.members, memberID)
+// supersedeSessionLocked 处理在线实例的并发接管：旧会话移入坟场。
+func (g *group) supersedeSessionLocked(inst *staticInstance, now time.Time) {
+	old := inst.sessionID
+	delete(g.members, old)
+	g.deadSessions[old] = deadSession{instance: inst.id, version: inst.version}
 }
 
-// expireLocked 剔除超时成员；有剔除时触发再均衡。返回被剔除成员 ID（升序）。
-func (c *Coordinator) expireLocked(g *group, now time.Time) []string {
-	var expired []string
-	for id, m := range g.members {
-		if now.Sub(m.lastHeartbeatAt) > g.sessionTimeout {
-			expired = append(expired, id)
+// evictInstanceLocked 真正清退静态实例：收集其仍生效持有的分区批次、删除身份
+// 与会话/坟场记录。返回 instanceID -> 升序分区批次（供整批单后继移交）。
+func (c *Coordinator) evictInstanceLocked(g *group, inst *staticInstance) map[string][]int {
+	batch := make([]int, 0)
+	for p := 0; p < g.partitions; p++ {
+		if g.assignment.OwnerOf(p) == inst.id {
+			batch = append(batch, p)
 		}
 	}
-	if len(expired) == 0 {
+	c.deleteInstanceLocked(g, inst)
+	if len(batch) == 0 {
 		return nil
 	}
-	sort.Strings(expired)
-	for _, id := range expired {
-		c.removeMemberLocked(g, id)
-	}
-	c.rebalanceLocked(g, now)
-	return expired
+	return map[string][]int{inst.id: batch}
 }
 
-// pendingLocked 返回成员尚未确认撤销的分区（升序）。
-func (g *group) pendingLocked(memberID string) []int {
-	required := g.revokeRequired[memberID]
+// deleteInstanceLocked 删除静态实例的活动会话、身份与相关坟场记录。
+func (c *Coordinator) deleteInstanceLocked(g *group, inst *staticInstance) {
+	if inst.online {
+		delete(g.members, inst.sessionID)
+	}
+	for sid, dead := range g.deadSessions {
+		if dead.instance == inst.id {
+			delete(g.deadSessions, sid)
+		}
+	}
+	delete(g.instances, inst.id)
+}
+
+// expireLocked 执行一次扫描，返回 真正退出的主体 ID（升序）、是否有静态会话
+// 仅转为暂时离线、以及清退实例的分区批次。调用方据此决定是否再均衡/持久化。
+func (c *Coordinator) expireLocked(g *group, now time.Time) (removed []string, offlineTransition bool, batches map[string][]int) {
+	// 1) 会话超时：动态成员直接剔除；静态会话转入保留期离线。
+	sessionIDs := make([]string, 0, len(g.members))
+	for id := range g.members {
+		sessionIDs = append(sessionIDs, id)
+	}
+	sort.Strings(sessionIDs)
+	for _, id := range sessionIDs {
+		m := g.members[id]
+		if now.Sub(m.lastHeartbeatAt) <= g.sessionTimeout {
+			continue
+		}
+		if !m.static {
+			delete(g.members, id)
+			removed = append(removed, id)
+			continue
+		}
+		inst := g.instances[m.instance]
+		delete(g.members, id)
+		inst.online = false
+		inst.sessionID = m.id
+		inst.offlineAt = now
+		inst.retainUntil = now.Add(inst.retention)
+		g.deadSessions[id] = deadSession{instance: inst.id, version: inst.version}
+		offlineTransition = true
+	}
+
+	// 静态会话转离线可能使原 leader 出缺：在不推进版本的前提下重算 leader
+	// （若随后还有真正清退，rebalanceLocked 会再算一次，结果一致）。
+	if offlineTransition {
+		g.leader = pickLeaderPrincipals(g.principalsLocked())
+	}
+
+	// 2) 保留期届满：离线静态实例真正清退。
+	instanceIDs := make([]string, 0, len(g.instances))
+	for id := range g.instances {
+		instanceIDs = append(instanceIDs, id)
+	}
+	sort.Strings(instanceIDs)
+	for _, id := range instanceIDs {
+		inst := g.instances[id]
+		if inst.online || !now.After(inst.retainUntil) {
+			continue
+		}
+		batch := c.evictInstanceLocked(g, inst)
+		removed = append(removed, id)
+		if batch != nil {
+			if batches == nil {
+				batches = make(map[string][]int)
+			}
+			batches[id] = batch[id]
+		}
+	}
+	sort.Strings(removed)
+	return removed, offlineTransition, batches
+}
+
+// pendingLocked 返回主体尚未确认撤销的分区（升序）。
+func (g *group) pendingLocked(principalID string) []int {
+	required := g.revokeRequired[principalID]
 	if len(required) == 0 {
 		return nil
 	}
-	acked := g.revokeAcked[memberID]
+	acked := g.revokeAcked[principalID]
 	var pending []int
 	for p := range required {
 		if _, ok := acked[p]; !ok {
@@ -623,26 +1000,69 @@ func (g *group) joinResultLocked(memberID string) JoinResult {
 	}
 }
 
-func (g *group) heartbeatResultLocked(memberID string) HeartbeatResult {
+func (g *group) staticJoinResultLocked(inst *staticInstance, rejoined bool) StaticJoinResult {
+	return StaticJoinResult{
+		InstanceID:       inst.id,
+		SessionID:        inst.sessionID,
+		SessionVersion:   inst.version,
+		Rejoined:         rejoined,
+		Generation:       g.generation,
+		Phase:            g.phase,
+		Leader:           g.leader,
+		Assignment:       g.assignment.clone(),
+		TargetAssignment: g.target.clone(),
+	}
+}
+
+func (g *group) heartbeatResultLocked(principalID string) HeartbeatResult {
 	return HeartbeatResult{
 		Generation:       g.generation,
 		Phase:            g.phase,
 		Assignment:       g.assignment.clone(),
 		TargetAssignment: g.target.clone(),
-		Revoking:         g.pendingLocked(memberID),
+		Revoking:         g.pendingLocked(principalID),
 	}
 }
 
 func (g *group) status() GroupStatus {
 	members := make([]Member, 0, len(g.members))
 	for _, m := range g.members {
-		members = append(members, Member{
+		vm := Member{
 			ID:              m.id,
+			Static:          m.static,
+			Online:          true,
+			SessionVersion:  m.sessionVersion,
 			JoinedAt:        m.joinedAt,
 			LastHeartbeatAt: m.lastHeartbeatAt,
-		})
+		}
+		if m.static {
+			vm.InstanceID = m.instance
+		}
+		members = append(members, vm)
 	}
 	sort.Slice(members, func(i, j int) bool { return members[i].ID < members[j].ID })
+
+	instances := make([]StaticInstanceStatus, 0, len(g.instances))
+	for _, inst := range g.instances {
+		held := make([]int, 0)
+		for p := 0; p < g.partitions; p++ {
+			if g.assignment.OwnerOf(p) == inst.id {
+				held = append(held, p)
+			}
+		}
+		instances = append(instances, StaticInstanceStatus{
+			InstanceID:      inst.id,
+			Online:          inst.online,
+			SessionID:       inst.sessionID,
+			SessionVersion:  inst.version,
+			JoinedAt:        inst.joinedAt,
+			LastHeartbeatAt: inst.lastHeartbeatAt,
+			OfflineAt:       inst.offlineAt,
+			RetainUntil:     inst.retainUntil,
+			HeldPartitions:  held,
+		})
+	}
+	sort.Slice(instances, func(i, j int) bool { return instances[i].InstanceID < instances[j].InstanceID })
 
 	offsets := make([]Offset, 0, len(g.offsets))
 	for _, o := range g.offsets {
@@ -670,6 +1090,48 @@ func (g *group) status() GroupStatus {
 	}
 	sort.Slice(progress, func(i, j int) bool { return progress[i].MemberID < progress[j].MemberID })
 
+	transfers := make([]PendingTransfer, 0)
+	for p := 0; p < g.partitions; p++ {
+		eff := g.assignment.OwnerOf(p)
+		tgt := g.target.OwnerOf(p)
+		if eff == "" {
+			continue
+		}
+		if inst, ok := g.instances[eff]; ok && !inst.online {
+			tr := PendingTransfer{
+				Partition:      p,
+				CurrentOwner:   eff,
+				Online:         false,
+				InstanceID:     inst.id,
+				SessionVersion: inst.version,
+			}
+			if eff != tgt {
+				// 本版本已指定新所有者但旧实例离线：撤销义务挂起。
+				tr.TargetOwner = tgt
+				tr.Reason = TransferReasonSuspended
+			} else {
+				// 分区钉住，等待重连或保留期届满。
+				tr.Reason = TransferReasonRetained
+			}
+			transfers = append(transfers, tr)
+			continue
+		}
+		if eff != tgt {
+			tr := PendingTransfer{
+				Partition:    p,
+				CurrentOwner: eff,
+				TargetOwner:  tgt,
+				Online:       true,
+				Reason:       TransferReasonRevoking,
+			}
+			if inst, ok := g.instances[eff]; ok {
+				tr.InstanceID = inst.id
+				tr.SessionVersion = inst.version
+			}
+			transfers = append(transfers, tr)
+		}
+	}
+
 	return GroupStatus{
 		Name:               g.name,
 		Partitions:         g.partitions,
@@ -677,10 +1139,12 @@ func (g *group) status() GroupStatus {
 		Phase:              g.phase,
 		Leader:             g.leader,
 		Members:            members,
+		StaticInstances:    instances,
 		Assignment:         g.assignment.clone(),
 		TargetAssignment:   g.target.clone(),
 		PendingRevocations: pending,
 		RevocationProgress: progress,
+		PendingTransfers:   transfers,
 		Offsets:            offsets,
 		LastRebalance:      g.lastRebalance,
 	}

@@ -30,18 +30,39 @@ type fileSnapshot struct {
 }
 
 type fileGroupSnapshot struct {
-	Name             string             `json:"name"`
-	Partitions       int                `json:"partitions"`
-	SessionTimeout   int64              `json:"session_timeout_ns"`
-	Generation       int64              `json:"generation"`
-	Phase            string             `json:"phase"`
-	Leader           string             `json:"leader"`
-	LastRebalance    time.Time          `json:"last_rebalance"`
-	Members          []fileMemberSnap   `json:"members"`
-	Assignment       fileAssignmentSnap `json:"assignment"`
-	TargetAssignment fileAssignmentSnap `json:"target_assignment"`
-	Revocations      []fileRevocation   `json:"revocations"`
-	Offsets          []fileOffsetSnap   `json:"offsets"`
+	Name             string                   `json:"name"`
+	Partitions       int                      `json:"partitions"`
+	SessionTimeout   int64                    `json:"session_timeout_ns"`
+	Generation       int64                    `json:"generation"`
+	Phase            string                   `json:"phase"`
+	Leader           string                   `json:"leader"`
+	LastRebalance    time.Time                `json:"last_rebalance"`
+	Members          []fileMemberSnap         `json:"members"`
+	StaticInstances  []fileStaticInstanceSnap `json:"static_instances"`
+	DeadSessions     []fileDeadSessionSnap    `json:"dead_sessions"`
+	Assignment       fileAssignmentSnap       `json:"assignment"`
+	TargetAssignment fileAssignmentSnap       `json:"target_assignment"`
+	Revocations      []fileRevocation         `json:"revocations"`
+	Offsets          []fileOffsetSnap         `json:"offsets"`
+}
+
+type fileStaticInstanceSnap struct {
+	ID              string            `json:"id"`
+	JoinedAt        time.Time         `json:"joined_at"`
+	Retention       int64             `json:"retention_ns"`
+	SessionVersion  int64             `json:"session_version"`
+	Online          bool              `json:"online"`
+	SessionID       string            `json:"session_id"`
+	LastHeartbeatAt time.Time         `json:"last_heartbeat_at"`
+	OfflineAt       time.Time         `json:"offline_at"`
+	RetainUntil     time.Time         `json:"retain_until"`
+	Requests        []fileRequestSnap `json:"requests"`
+}
+
+type fileDeadSessionSnap struct {
+	SessionID string `json:"session_id"`
+	Instance  string `json:"instance"`
+	Version   int64  `json:"version"`
 }
 
 type fileRevocation struct {
@@ -52,6 +73,9 @@ type fileRevocation struct {
 
 type fileMemberSnap struct {
 	ID              string            `json:"id"`
+	Static          bool              `json:"static"`
+	Instance        string            `json:"instance,omitempty"`
+	SessionVersion  int64             `json:"session_version,omitempty"`
 	JoinedAt        time.Time         `json:"joined_at"`
 	LastHeartbeatAt time.Time         `json:"last_heartbeat_at"`
 	Requests        []fileRequestSnap `json:"requests"`
@@ -79,7 +103,7 @@ type fileOffsetSnap struct {
 	LastRequestID string    `json:"last_request_id"`
 }
 
-const snapshotFormatVersion = 2
+const snapshotFormatVersion = 3
 
 // Save 原子写入整份快照。
 func (s *FileStore) Save(snap Snapshot) error {
@@ -140,14 +164,16 @@ func toFileSnapshot(s *Snapshot) fileSnapshot {
 	out := fileSnapshot{Version: snapshotFormatVersion, Groups: make([]fileGroupSnapshot, 0, len(s.Groups))}
 	for _, g := range s.Groups {
 		fg := fileGroupSnapshot{
-			Name:           g.Name,
-			Partitions:     g.Partitions,
-			SessionTimeout: int64(g.SessionTimeout),
-			Generation:     g.Generation,
-			Phase:          string(g.Phase),
-			Leader:         g.Leader,
-			LastRebalance:  g.LastRebalance,
-			Members:        make([]fileMemberSnap, 0, len(g.Members)),
+			Name:            g.Name,
+			Partitions:      g.Partitions,
+			SessionTimeout:  int64(g.SessionTimeout),
+			Generation:      g.Generation,
+			Phase:           string(g.Phase),
+			Leader:          g.Leader,
+			LastRebalance:   g.LastRebalance,
+			Members:         make([]fileMemberSnap, 0, len(g.Members)),
+			StaticInstances: make([]fileStaticInstanceSnap, 0, len(g.StaticInstances)),
+			DeadSessions:    make([]fileDeadSessionSnap, 0, len(g.DeadSessions)),
 			Assignment: fileAssignmentSnap{
 				Generation: g.Assignment.Generation,
 				CreatedAt:  g.Assignment.CreatedAt,
@@ -164,6 +190,9 @@ func toFileSnapshot(s *Snapshot) fileSnapshot {
 		for _, m := range g.Members {
 			fm := fileMemberSnap{
 				ID:              m.ID,
+				Static:          m.Static,
+				Instance:        m.Instance,
+				SessionVersion:  m.SessionVersion,
 				JoinedAt:        m.JoinedAt,
 				LastHeartbeatAt: m.LastHeartbeatAt,
 				Requests:        make([]fileRequestSnap, 0, len(m.Requests)),
@@ -178,6 +207,35 @@ func toFileSnapshot(s *Snapshot) fileSnapshot {
 				})
 			}
 			fg.Members = append(fg.Members, fm)
+		}
+		for _, is := range g.StaticInstances {
+			fis := fileStaticInstanceSnap{
+				ID:              is.ID,
+				JoinedAt:        is.JoinedAt,
+				Retention:       int64(is.Retention),
+				SessionVersion:  is.SessionVersion,
+				Online:          is.Online,
+				SessionID:       is.SessionID,
+				LastHeartbeatAt: is.LastHeartbeatAt,
+				OfflineAt:       is.OfflineAt,
+				RetainUntil:     is.RetainUntil,
+				Requests:        make([]fileRequestSnap, 0, len(is.Requests)),
+			}
+			for _, r := range is.Requests {
+				fis.Requests = append(fis.Requests, fileRequestSnap{
+					RequestID:   r.RequestID,
+					Partition:   r.Partition,
+					Offset:      r.Offset,
+					Metadata:    r.Metadata,
+					CommittedAt: r.CommittedAt,
+				})
+			}
+			fg.StaticInstances = append(fg.StaticInstances, fis)
+		}
+		for _, d := range g.DeadSessions {
+			fg.DeadSessions = append(fg.DeadSessions, fileDeadSessionSnap{
+				SessionID: d.SessionID, Instance: d.Instance, Version: d.Version,
+			})
 		}
 		for _, rv := range g.Revocations {
 			fg.Revocations = append(fg.Revocations, fileRevocation{
@@ -204,14 +262,16 @@ func fromFileSnapshot(fs *fileSnapshot) *Snapshot {
 	snap := &Snapshot{Groups: make([]GroupSnapshot, 0, len(fs.Groups))}
 	for _, fg := range fs.Groups {
 		g := GroupSnapshot{
-			Name:           fg.Name,
-			Partitions:     fg.Partitions,
-			SessionTimeout: time.Duration(fg.SessionTimeout),
-			Generation:     fg.Generation,
-			Phase:          RebalancePhase(fg.Phase),
-			Leader:         fg.Leader,
-			LastRebalance:  fg.LastRebalance,
-			Members:        make([]MemberSnapshot, 0, len(fg.Members)),
+			Name:            fg.Name,
+			Partitions:      fg.Partitions,
+			SessionTimeout:  time.Duration(fg.SessionTimeout),
+			Generation:      fg.Generation,
+			Phase:           RebalancePhase(fg.Phase),
+			Leader:          fg.Leader,
+			LastRebalance:   fg.LastRebalance,
+			Members:         make([]MemberSnapshot, 0, len(fg.Members)),
+			StaticInstances: make([]StaticInstanceSnapshot, 0, len(fg.StaticInstances)),
+			DeadSessions:    make([]DeadSessionSnapshot, 0, len(fg.DeadSessions)),
 			Assignment: Assignment{
 				Generation: fg.Assignment.Generation,
 				CreatedAt:  fg.Assignment.CreatedAt,
@@ -228,6 +288,9 @@ func fromFileSnapshot(fs *fileSnapshot) *Snapshot {
 		for _, fm := range fg.Members {
 			m := MemberSnapshot{
 				ID:              fm.ID,
+				Static:          fm.Static,
+				Instance:        fm.Instance,
+				SessionVersion:  fm.SessionVersion,
 				JoinedAt:        fm.JoinedAt,
 				LastHeartbeatAt: fm.LastHeartbeatAt,
 				Requests:        make([]RequestSnapshot, 0, len(fm.Requests)),
@@ -242,6 +305,35 @@ func fromFileSnapshot(fs *fileSnapshot) *Snapshot {
 				})
 			}
 			g.Members = append(g.Members, m)
+		}
+		for _, fis := range fg.StaticInstances {
+			is := StaticInstanceSnapshot{
+				ID:              fis.ID,
+				JoinedAt:        fis.JoinedAt,
+				Retention:       time.Duration(fis.Retention),
+				SessionVersion:  fis.SessionVersion,
+				Online:          fis.Online,
+				SessionID:       fis.SessionID,
+				LastHeartbeatAt: fis.LastHeartbeatAt,
+				OfflineAt:       fis.OfflineAt,
+				RetainUntil:     fis.RetainUntil,
+				Requests:        make([]RequestSnapshot, 0, len(fis.Requests)),
+			}
+			for _, fr := range fis.Requests {
+				is.Requests = append(is.Requests, RequestSnapshot{
+					RequestID:   fr.RequestID,
+					Partition:   fr.Partition,
+					Offset:      fr.Offset,
+					Metadata:    fr.Metadata,
+					CommittedAt: fr.CommittedAt,
+				})
+			}
+			g.StaticInstances = append(g.StaticInstances, is)
+		}
+		for _, fd := range fg.DeadSessions {
+			g.DeadSessions = append(g.DeadSessions, DeadSessionSnapshot{
+				SessionID: fd.SessionID, Instance: fd.Instance, Version: fd.Version,
+			})
 		}
 		for _, fr := range fg.Revocations {
 			g.Revocations = append(g.Revocations, RevocationSnapshot{
